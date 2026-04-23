@@ -12,7 +12,7 @@ import com.intellij.openapi.util.Disposer
  * 任务行背景提供者初始化器
  * 在 IDE 启动时初始化 TaskLineBackgroundProvider
  */
-class TaskLineBackgroundProviderInitializer : StartupActivity {
+class TaskLineBackgroundProviderInitializer : StartupActivity.DumbAware {
     private var taskLineBackgroundProvider: TaskLineBackgroundProvider? = null
     
     override fun runActivity(project: Project) {

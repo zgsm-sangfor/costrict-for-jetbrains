@@ -77,7 +77,7 @@ open class AbsEventBus : Disposable{
      * Use IntelliJ platform's thread-safe methods instead of coroutines
      */
     fun <T : Any> emitInApplication(eventType: EventType<T>, data: T) {
-        ApplicationManager.getApplication().invokeLater {
+        ApplicationManager.getApplication().executeOnPooledThread {
             ApplicationManager.getApplication().runReadAction {
                 listeners[eventType]?.forEach { listener ->
                     @Suppress("UNCHECKED_CAST")

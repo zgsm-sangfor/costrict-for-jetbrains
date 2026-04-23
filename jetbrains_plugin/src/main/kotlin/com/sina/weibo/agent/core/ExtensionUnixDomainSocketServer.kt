@@ -147,12 +147,6 @@ class ExtensionUnixDomainSocketServer : ISocketServer {
                     break
                 }
 
-                // Check channel health
-                if (!clientChannel.isOpen) {
-                    logger.error("[UDS] Client channel unhealthy, closing.")
-                    break
-                }
-
                 val responsiveState = manager.getResponsiveState()
                 if (responsiveState != null) {
                     logger.debug("[UDS] Client RPC state: $responsiveState")

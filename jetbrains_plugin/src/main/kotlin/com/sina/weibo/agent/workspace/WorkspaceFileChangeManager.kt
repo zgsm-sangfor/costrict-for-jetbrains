@@ -191,12 +191,8 @@ class WorkspaceFileChangeManager(val project: Project) : Disposable {
                     // Store by type
                     if (file.isDirectory) {
                         directoryChanges.add(changeData)
-                        // Trigger event for each directory change
-                        triggerDirectoryChangeEvent(changeData)
                     } else {
                         fileChanges.add(changeData)
-                        // Trigger event for each file change
-                        triggerFileChangeEvent(changeData)
                     }
                 }
             }
@@ -347,6 +343,12 @@ class WorkspaceFileChangeManager(val project: Project) : Disposable {
 
         // For files, ignore temporary files
         if (!file.isDirectory && (file.name.endsWith("~") || file.name.endsWith(".tmp"))) {
+            return false
+        }
+
+        // Ignore common build/output directories
+        val ignoredDirs = setOf("node_modules", ".idea", "build", "out", "dist", ".gradle", "target", ".git")
+        if (file.name in ignoredDirs || file.path.split("/").any { it in ignoredDirs }) {
             return false
         }
 
