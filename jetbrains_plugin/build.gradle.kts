@@ -319,6 +319,13 @@ tasks {
         sinceBuild.set(properties("pluginSinceBuild"))
         untilBuild.set("")
     }
+
+    // Disable buildSearchableOptions to avoid ConcurrentModificationException
+    // during IDE startup in headless build environments. This task is optional
+    // and only affects the searchable options index for plugin settings.
+    buildSearchableOptions {
+        enabled = false
+    }
     
     // 创建任务：动态替换 plugin.xml 中的版本号
     register("updatePluginXmlVersion") {

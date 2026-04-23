@@ -943,7 +943,7 @@ class CommentManager(private val project: Project) : Disposable {
             border = JBUI.Borders.empty()
             isOpaque = false
             viewport.isOpaque = false
-            preferredSize = JBUI.size(360, 220)
+            preferredSize = JBUI.size(500, 220)
         }
 
         panel.add(scrollPane, BorderLayout.CENTER)
