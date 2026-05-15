@@ -18,6 +18,8 @@ import { SerializedError, transformErrorFromSerialization } from '../vscode/vs/b
 import { IRemoteConsoleLog } from '../vscode/vs/base/common/console.js';
 import { FileType, FilePermission, FileSystemProviderErrorCode } from '../vscode/vs/platform/files/common/files.js';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { promisify } from 'util';
 import { ConfigurationModel } from '../vscode/vs/platform/configuration/common/configurationModels.js';
 import { NullLogService } from '../vscode/vs/platform/log/common/log.js';
@@ -42,6 +44,72 @@ const fsMkdir = promisify(fs.mkdir);
 // Debug logging helper - only logs when COStrict_DEBUG=1
 const isDebug = process.env.COStrict_DEBUG === '1';
 const debugLog = (...args: any[]) => { if (isDebug) console.log('[Debug]', ...args); };
+
+// ─── Configuration Persistence ───────────────────────────────────────────────
+// Persists VS Code configuration data to ~/.costrict-jetbrains/config.json so
+// that settings like uiMode survive process restarts.
+
+const CONFIG_DIR = path.join(os.homedir(), '.costrict-jetbrains');
+const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
+const NULL_LOG_SERVICE = new NullLogService();
+
+/** In-memory configuration contents keyed by config key (e.g. "costrict.uiMode"). */
+const persistedConfig: Record<string, any> = loadPersistedConfig();
+
+function ensureConfigDir(): void {
+	try {
+		if (!fs.existsSync(CONFIG_DIR)) {
+			fs.mkdirSync(CONFIG_DIR, { recursive: true });
+		}
+	} catch (e) {
+		console.error('[ConfigStore] Failed to create config dir:', e);
+	}
+}
+
+function loadPersistedConfig(): Record<string, any> {
+	try {
+		if (fs.existsSync(CONFIG_PATH)) {
+			const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
+			return JSON.parse(raw);
+		}
+	} catch (e) {
+		console.error('[ConfigStore] Failed to load config:', e);
+	}
+	return {};
+}
+
+function savePersistedConfig(): void {
+	ensureConfigDir();
+	try {
+		fs.writeFileSync(CONFIG_PATH, JSON.stringify(persistedConfig, null, 2), 'utf-8');
+		debugLog('[ConfigStore] Config saved:', persistedConfig);
+	} catch (e) {
+		console.error('[ConfigStore] Failed to save config:', e);
+	}
+}
+
+function buildConfigurationModel(config: Record<string, any>): ConfigurationModel {
+	const model = ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE);
+	for (const [key, value] of Object.entries(config)) {
+		model.setValue(key, value);
+	}
+	return model;
+}
+
+// ─── Context Key Store ───────────────────────────────────────────────────────
+// Stores VSCode context keys that are set via setContext command.
+// These control "when" clauses for view visibility.
+
+const contextKeys = new Map<string, any>();
+
+function setContextKey(key: string, value: any): void {
+	contextKeys.set(key, value);
+	debugLog('[ContextStore] setContext:', key, '=', value);
+}
+
+function getContextKey(key: string): any {
+	return contextKeys.get(key);
+}
 
 class RPCLogger implements IRPCProtocolLogger {
     logIncoming(msgLength: number, req: number, initiator: RequestInitiator, msg: string, data?: any): void {
@@ -77,14 +145,18 @@ export class RPCManager {
         // ExtHostConfiguration
         const extHostConfiguration = this.rpcProtocol.getProxy(ExtHostContext.ExtHostConfiguration);
         
+        // Build userLocal model from persisted config so that settings
+        // like costrict.uiMode are loaded on startup.
+        const userLocalModel = buildConfigurationModel(persistedConfig);
+        
         // Send initialization configuration message
         extHostConfiguration.$initializeConfiguration({
-            defaults: ConfigurationModel.createEmptyModel(new NullLogService()),
-            policy: ConfigurationModel.createEmptyModel(new NullLogService()),
-            application: ConfigurationModel.createEmptyModel(new NullLogService()),
-            userLocal: ConfigurationModel.createEmptyModel(new NullLogService()),
-            userRemote: ConfigurationModel.createEmptyModel(new NullLogService()),
-            workspace: ConfigurationModel.createEmptyModel(new NullLogService()),
+            defaults: ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE),
+            policy: ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE),
+            application: ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE),
+            userLocal: userLocalModel,
+            userRemote: ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE),
+            workspace: ConfigurationModel.createEmptyModel(NULL_LOG_SERVICE),
             folders: [],
             configurationScopes: []
         });
@@ -199,6 +271,31 @@ export class RPCManager {
             },
             $executeCommand<T>(id: string, ...args: any[]): Promise<T> {
                 debugLog('Execute command:', id, args);
+                
+                // Handle the built-in setContext command that costrict uses.
+                // The ext host translates "setContext" -> "_setContext" before
+                // sending to MainThreadCommands, to update context keys (e.g. "costrict.uiMode").
+                // Syntax: _setContext(key, value)
+                if ((id === 'setContext' || id === '_setContext') && args.length >= 2) {
+                    setContextKey(String(args[0]), args[1]);
+                    return Promise.resolve(null as T);
+                }
+                
+                // Handle getContext for parity.
+                if ((id === 'getContext' || id === '_getContext') && args.length >= 1) {
+                    return Promise.resolve(getContextKey(String(args[0])) as T);
+                }
+                
+                // Handle workbench.action.reloadWindow by restarting the
+                // extension host process. The Kotlin side will detect the
+                // process exit and reconnect.
+                if (id === 'workbench.action.reloadWindow') {
+                    console.log('[MainThreadCommands] Reloading extension host...');
+                    // Use setImmediate so we return the promise before exiting
+                    setImmediate(() => process.exit(0));
+                    return Promise.resolve(null as T);
+                }
+                
                 return Promise.resolve(null as T);
             },
             $fireCommandActivationEvent(id: string): void {
@@ -383,13 +480,24 @@ export class RPCManager {
         });
 
         // MainThreadConfiguration
+        const self = this;
         this.rpcProtocol.set(MainContext.MainThreadConfiguration, {
             $updateConfigurationOption(target: any, key: string, value: any, overrides: any, scopeToLanguage: boolean | undefined): Promise<void> {
                 debugLog('Update configuration option:', { target, key, value, overrides, scopeToLanguage });
+                // Persist to in-memory store and flush to disk so the
+                // setting survives extension host restarts.
+                persistedConfig[key] = value;
+                savePersistedConfig();
+                // Keep the extension host in-memory model in sync
+                self.notifyExtHostConfigurationChanged([key]);
                 return Promise.resolve();
             },
             $removeConfigurationOption(target: any, key: string, overrides: any, scopeToLanguage: boolean | undefined): Promise<void> {
                 debugLog('Remove configuration option:', { target, key, overrides, scopeToLanguage });
+                delete persistedConfig[key];
+                savePersistedConfig();
+                // Keep the extension host in-memory model in sync
+                self.notifyExtHostConfigurationChanged([key]);
                 return Promise.resolve();
             },
             dispose(): void {
@@ -927,6 +1035,28 @@ export class RPCManager {
 
         // MainThreadWebviews
         this.rpcProtocol.set(MainContext.MainThreadWebviews, webViewManager);
+    }
+
+    /** Notify the extension host that persisted configuration has changed.
+     *  This keeps the ext-host in-memory model in sync with the on-disk config
+     *  so that immediate reads of getConfiguration() return the latest value. */
+    private notifyExtHostConfigurationChanged(changedKeys: string[]): void {
+        try {
+            const extHostConfig = this.rpcProtocol.getProxy(ExtHostContext.ExtHostConfiguration);
+            const data: any = {
+                defaults: { contents: {}, keys: [], overrides: [] },
+                policy: { contents: {}, keys: [], overrides: [] },
+                application: { contents: {}, keys: [], overrides: [] },
+                userLocal: buildConfigurationModel(persistedConfig).toJSON(),
+                userRemote: { contents: {}, keys: [], overrides: [] },
+                workspace: { contents: {}, keys: [], overrides: [] },
+                folders: [],
+                configurationScopes: []
+            };
+            extHostConfig.$acceptConfigurationChanged(data, { keys: changedKeys, overrides: [] });
+        } catch (e) {
+            debugLog('[ConfigStore] Failed to notify ext host:', e);
+        }
     }
 
     public getRPCProtocol(): IRPCProtocol | null {

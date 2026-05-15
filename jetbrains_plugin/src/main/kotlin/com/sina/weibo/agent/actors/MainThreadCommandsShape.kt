@@ -5,8 +5,10 @@
 package com.sina.weibo.agent.actors
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.wm.ToolWindowManager
 import com.sina.weibo.agent.commands.CommandRegistry
 import com.sina.weibo.agent.commands.ICommand
 import com.sina.weibo.agent.diff.DiffViewRegistrar
@@ -62,6 +64,9 @@ interface MainThreadCommandsShape : Disposable {
 class MainThreadCommands(val project: Project) : MainThreadCommandsShape {
     private val registry = CommandRegistry(project)
     private val logger = Logger.getInstance(MainThreadCommandsShape::class.java)
+
+    /** VSCode-compatible context key store, used by extensions to track UI state. */
+    private val contextKeys = mutableMapOf<String, Any?>()
     
     /**
      * Initializes the command registry with default commands.
@@ -108,13 +113,50 @@ class MainThreadCommands(val project: Project) : MainThreadCommandsShape {
      */
     override suspend fun executeCommand(id: String, args: List<Any?>): Any? {
         logger.info("Executing command: $id ")
-        
+
+        // Handle VSCode built-in commands that don't have JetBrains equivalents
+        when {
+            // _setContext / setContext – store context key for parity with VSCode "when" clauses
+            id == "_setContext" || id == "setContext" -> {
+                if (args.size >= 2) {
+                    val key = args[0]?.toString() ?: ""
+                    contextKeys[key] = args[1]
+                    logger.info("setContext: $key = ${args[1]}")
+                }
+                return Unit
+            }
+            // _getContext / getContext – retrieve a stored context key
+            id == "_getContext" || id == "getContext" -> {
+                if (args.isNotEmpty()) {
+                    val key = args[0]?.toString() ?: ""
+                    return contextKeys[key]
+                }
+                return null
+            }
+            // Costrict sidebar focus commands – activate the CoStrict tool window
+            id == "costrict.AssistantUISidebarProvider.focus" ||
+            id == "costrict.SidebarProvider.focus" -> {
+                ApplicationManager.getApplication().invokeLater {
+                    val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("CoStrict")
+                    toolWindow?.show { }
+                }
+                logger.info("Focused CoStrict tool window for command: $id")
+                return Unit
+            }
+            // workbench.action.reloadWindow – restart the IDE
+            id == "workbench.action.reloadWindow" -> {
+                logger.info("Reloading IDE window...")
+                ApplicationManager.getApplication().restart()
+                return Unit
+            }
+        }
+
         // 添加命令映射逻辑，处理 VSCode 与 JetBrains 命令命名差异
         val commandId = when (id) {
             "_workbench.changes" -> "vscode.changes"  // 映射 _workbench.changes 到 vscode.changes
             else -> id
         }
-        
+
         registry.getCommand(commandId)?.let { cmd->
             runCmd(cmd,args)
         }?: run {

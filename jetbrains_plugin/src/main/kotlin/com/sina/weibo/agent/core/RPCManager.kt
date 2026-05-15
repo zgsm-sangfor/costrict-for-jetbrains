@@ -17,6 +17,7 @@ import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ProxyConfigUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * Responsible for managing RPC protocols, service registration and implementation, plugin lifecycle management
@@ -73,13 +74,26 @@ class RPCManager(
                     logger.info("Using proxy configuration for initialization: $it")
                 }
 
-                // Create empty configuration model
+                // Create empty configuration model sections
                 val emptyMap = mapOf(
                     "contents" to emptyMap<String, Any>(),
                     "keys" to emptyList<String>(),
                     "overrides" to emptyList<String>()
                 )
-                
+
+                // Load persisted configuration from ~/.costrict-jetbrains/config.json
+                // so that settings like costrict.uiMode survive extension host restarts.
+                val persistedConfig = loadPersistedConfig()
+                val userLocalModel = if (persistedConfig.isNotEmpty()) {
+                    mapOf(
+                        "contents" to buildNestedContents(persistedConfig),
+                        "keys" to persistedConfig.keys.toList(),
+                        "overrides" to emptyList<String>()
+                    )
+                } else {
+                    emptyMap
+                }
+
                 val emptyConfigModel = mapOf(
                     "defaults" to mapOf(
                         "contents" to contentsBuilder,
@@ -88,7 +102,7 @@ class RPCManager(
                     ),
                     "policy" to emptyMap,
                     "application" to emptyMap,
-                    "userLocal" to emptyMap,
+                    "userLocal" to userLocalModel,
                     "userRemote" to emptyMap,
                     "workspace" to emptyMap,
                     "folders" to emptyList<Any>(),
@@ -146,7 +160,7 @@ class RPCManager(
         rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadDebugService, MainThreadDebugService())
 
         // MainThreadConfiguration
-        rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadConfiguration, MainThreadConfiguration())
+        rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadConfiguration, MainThreadConfiguration(project))
 
         // MainThreadWorkspace
         val workspaceManager = project.getService(WorkspaceManager::class.java)
@@ -289,5 +303,51 @@ class RPCManager(
      */
     fun getRPCProtocol(): IRPCProtocol {
         return rpcProtocol
+    }
+
+    companion object {
+        private const val CONFIG_DIR_NAME = ".costrict-jetbrains"
+        private const val CONFIG_FILE_NAME = "config.json"
+
+        /**
+         * Load persisted configuration from ~/.costrict-jetbrains/config.json.
+         * Used to restore settings like uiMode on extension host restart.
+         */
+        fun loadPersistedConfig(): Map<String, Any?> {
+            val configFile = File(System.getProperty("user.home"), "$CONFIG_DIR_NAME/$CONFIG_FILE_NAME")
+            if (!configFile.exists()) return emptyMap()
+            return try {
+                val json = configFile.readText()
+                @Suppress("UNCHECKED_CAST")
+                (com.google.gson.Gson().fromJson(json, Map::class.java) as? Map<String, Any?>) ?: emptyMap()
+            } catch (e: Exception) {
+                Logger.getInstance(RPCManager::class.java).warn("Failed to load config.json: ${e.message}")
+                emptyMap()
+            }
+        }
+
+        /**
+         * Convert a flat config map with dot-separated keys into a nested map structure.
+         * E.g. {"costrict.uiMode": "cloud"} -> {"costrict": {"uiMode": "cloud"}}.
+         * This matches the VSCode ConfigurationModel contents format.
+         */
+        fun buildNestedContents(flatConfig: Map<String, Any?>): Map<String, Any?> {
+            val result = mutableMapOf<String, Any?>()
+            for ((key, value) in flatConfig) {
+                val parts = key.split(".")
+                var current = result
+                for (i in parts.indices) {
+                    val part = parts[i]
+                    if (i == parts.lastIndex) {
+                        current[part] = value
+                    } else {
+                        @Suppress("UNCHECKED_CAST")
+                        val next = current.getOrPut(part) { mutableMapOf<String, Any?>() } as MutableMap<String, Any?>
+                        current = next
+                    }
+                }
+            }
+            return result
+        }
     }
 }
