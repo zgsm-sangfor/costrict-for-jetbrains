@@ -97,6 +97,10 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     private var isDisposed = false
     private var themeInitialized = false
 
+    // Current UI mode ("classic" or "cloud"), synced from setContext("costrict.uiMode", ...)
+    @Volatile
+    private var uiMode: String? = null
+
     /**
      * Initialize theme manager
      * @param resourceRoot Resource root directory
@@ -351,24 +355,42 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         }
 
         // ── Dispose existing WebViewInstance of a different viewType ──
+        // Only dispose if the new viewType matches the current uiMode, so that a
+        // mis-matched provider registration (e.g. classic provider registering while
+        // the mode is "cloud") doesn't tear down the active WebView.
         val existingDifferentViewType = viewTypeToWebview.entries.firstOrNull { it.key != data.viewType }
         if (existingDifferentViewType != null) {
             val oldViewType = existingDifferentViewType.key
             val oldInstance = existingDifferentViewType.value
-            logger.info("registerProvider: disposing old WebViewInstance for different viewType=$oldViewType (new=$data.viewType)")
 
-            // Remove old browser component from the panel
-            removeBrowserComponentFromPanel(oldInstance)
-
-            // Remove from routing maps
-            viewTypeToWebview.remove(oldViewType)
-            handleToWebview.entries.removeAll { it.value == oldInstance }
-            if (latestWebView == oldInstance) {
-                latestWebView = null
+            // If the new viewType matches the current mode, dispose the old one
+            // and show the new one.  Otherwise keep the old one visible.
+            val shouldSwitch = when (uiMode) {
+                "cloud" -> data.viewType == "costrict.AssistantUISidebarProvider"
+                "classic" -> data.viewType == "costrict.SidebarProvider"
+                else -> true // no mode set yet — switch unconditionally
             }
 
-            // Dispose JCEF browser resources
-            Disposer.dispose(oldInstance)
+            if (shouldSwitch) {
+                logger.info("registerProvider: disposing old WebViewInstance for different viewType=$oldViewType (new=$data.viewType, uiMode=$uiMode)")
+
+                // Remove old browser component from the panel
+                removeBrowserComponentFromPanel(oldInstance)
+
+                // Remove from routing maps
+                viewTypeToWebview.remove(oldViewType)
+                handleToWebview.entries.removeAll { it.value == oldInstance }
+                if (latestWebView == oldInstance) {
+                    latestWebView = null
+                }
+
+                // Dispose JCEF browser resources
+                Disposer.dispose(oldInstance)
+            } else {
+                // The new viewType doesn't match current mode — register it in
+                // the background, but keep the active WebView visible and routable.
+                logger.info("registerProvider: registering viewType=${data.viewType} in background (uiMode=$uiMode, keeping $oldViewType visible)")
+            }
         }
 
         // ── If the same viewType already exists, re-resolve it ──
@@ -426,8 +448,21 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         handleToWebview[viewId] = webview
         viewTypeToWebview[data.viewType] = webview
 
-        logger.debug("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
-        notifyWebViewCreated(webview)
+        // Only add the WebView to the tool window panel if it matches the
+        // current uiMode.  Mismatched providers are kept for routing but
+        // remain hidden until a mode switch brings them to the front.
+        val shouldShow = when (uiMode) {
+            "cloud" -> data.viewType == "costrict.AssistantUISidebarProvider"
+            "classic" -> data.viewType == "costrict.SidebarProvider"
+            else -> true // no mode set yet — show unconditionally
+        }
+
+        if (shouldShow) {
+            logger.debug("Create WebView instance (visible): viewType=${data.viewType}, viewId=$viewId, uiMode=$uiMode")
+            notifyWebViewCreated(webview)
+        } else {
+            logger.debug("Create WebView instance (hidden): viewType=${data.viewType}, viewId=$viewId, uiMode=$uiMode")
+        }
     }
 
     /**
@@ -456,6 +491,69 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
          */
     fun getWebViewByViewType(viewType: String): WebViewInstance? {
         return viewTypeToWebview[viewType] ?: latestWebView
+    }
+
+    /**
+     * Set the current UI mode and switch the visible WebView accordingly.
+     * Called from MainThreadCommands when setContext("costrict.uiMode", ...) is
+     * executed by the extension.
+     *
+     * @param mode "classic" to show costrict.SidebarProvider, "cloud" to show costrict.AssistantUISidebarProvider
+     */
+    fun setUiMode(mode: String?) {
+        uiMode = mode
+        logger.info("setUiMode: $mode")
+        switchToCurrentMode()
+    }
+
+    /**
+     * Get the current UI mode.
+     */
+    fun getUiMode(): String? = uiMode
+
+    /**
+     * Switch the tool window to show the WebView that matches the current mode.
+     * ViewType mapping: classic → "costrict.SidebarProvider", cloud → "costrict.AssistantUISidebarProvider"
+     */
+    private fun switchToCurrentMode() {
+        val targetViewType = when (uiMode) {
+            "cloud" -> "costrict.AssistantUISidebarProvider"
+            "classic" -> "costrict.SidebarProvider"
+            else -> return
+        }
+        val targetWebView = viewTypeToWebview[targetViewType] ?: return
+
+        logger.info("switchToCurrentMode: switching to viewType=$targetViewType (uiMode=$uiMode)")
+
+        // Notify creation callbacks to show this WebView, which replaces the current one
+        val callbacks = synchronized(creationCallbacks) { creationCallbacks.toList() }
+        ApplicationManager.getApplication().invokeLater {
+            // Remove any previously visible WebView from the panel first
+            if (latestWebView != null) {
+                for (callback in callbacks) {
+                    callback.removeWebViewComponent(latestWebView!!)
+                }
+            }
+            // Show the target WebView
+            for (callback in callbacks) {
+                callback.onWebViewCreated(targetWebView)
+            }
+        }
+
+        // Remove any stale WebView whose viewType doesn't match the current mode
+        for ((existingViewType, instance) in viewTypeToWebview.entries) {
+            if (existingViewType != targetViewType) {
+                removeBrowserComponentFromPanel(instance)
+                handleToWebview.entries.removeAll { it.value == instance }
+                viewTypeToWebview.remove(existingViewType)
+                if (!instance.isDisposed()) {
+                    Disposer.dispose(instance)
+                }
+                logger.info("switchToCurrentMode: removed stale WebView viewType=$existingViewType")
+            }
+        }
+
+        latestWebView = targetWebView
     }
 
     /**
@@ -541,11 +639,6 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
                                 });
                             };
                         })();
-                        
-                        // Clean up references to window parent for security
-                        delete window.parent;
-                        delete window.top;
-                        delete window.frameElement;
                         
                         console.log("VSCode API mock injected");
                         """
@@ -840,13 +933,45 @@ class WebViewInstance(
                                             defaultStylesElement.id = '_defaultStyles';
                                             document.head.appendChild(defaultStylesElement);
                                         }
-                                        
+
                                         // Add default_themes.css content
-                                        defaultStylesElement.textContent = `
+                                        // Cloud UI (AssistantUISidebarProvider) is a complete web app with its own
+                                        // layout system — skip body styles that would conflict with its layout.
+                                        const isCloudUi = ${this.viewType == "costrict.AssistantUISidebarProvider"};
+                                        defaultStylesElement.textContent = isCloudUi ? `
                                             html {
                                                 scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
                                             }
-                                            
+
+                                            ::-webkit-scrollbar {
+                                                width: 10px;
+                                                height: 10px;
+                                            }
+
+                                            ::-webkit-scrollbar-corner {
+                                                background-color: var(--vscode-editor-background);
+                                            }
+
+                                            ::-webkit-scrollbar-thumb {
+                                                background-color: var(--vscode-scrollbarSlider-background);
+                                            }
+                                            ::-webkit-scrollbar-thumb:hover {
+                                                background-color: var(--vscode-scrollbarSlider-hoverBackground);
+                                            }
+                                            ::-webkit-scrollbar-thumb:active {
+                                                background-color: var(--vscode-scrollbarSlider-activeBackground);
+                                            }
+                                            ::highlight(find-highlight) {
+                                                background-color: var(--vscode-editor-findMatchHighlightBackground);
+                                            }
+                                            ::highlight(current-find-highlight) {
+                                                background-color: var(--vscode-editor-findMatchBackground);
+                                            }
+                                        ` : `
+                                            html {
+                                                scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
+                                            }
+
                                             body {
                                                 overscroll-behavior-x: none;
                                                 background-color: transparent;
@@ -859,25 +984,25 @@ class WebViewInstance(
                                                 overflow-x: hidden;   /* prevent horizontal scrollbar */
                                                 overflow-y: auto;     /* allow vertical scrolling only */
                                             }
-                                            
+
                                             img, video {
                                                 max-width: 100%;
                                                 height: auto;        /* keep aspect ratio and avoid vertical overflow */
                                                 display: block;      /* remove inline baseline gaps that can trigger overflow */
                                             }
-                                            
+
                                             a, a code {
                                                 color: var(--vscode-textLink-foreground);
                                             }
-                                            
+
                                             p > a {
                                                 text-decoration: var(--text-link-decoration);
                                             }
-                                            
+
                                             a:hover {
                                                 color: var(--vscode-textLink-activeForeground);
                                             }
-                                            
+
                                             a:focus,
                                             input:focus,
                                             select:focus,
@@ -885,7 +1010,7 @@ class WebViewInstance(
                                                 outline: 1px solid -webkit-focus-ring-color;
                                                 outline-offset: -1px;
                                             }
-                                            
+
                                             code {
                                                 font-family: var(--monaco-monospace-font);
                                                 color: var(--vscode-textPreformat-foreground);
@@ -893,16 +1018,16 @@ class WebViewInstance(
                                                 padding: 1px 3px;
                                                 border-radius: 4px;
                                             }
-                                            
+
                                             pre code {
                                                 padding: 0;
                                             }
-                                            
+
                                             blockquote {
                                                 background: var(--vscode-textBlockQuote-background);
                                                 border-color: var(--vscode-textBlockQuote-border);
                                             }
-                                            
+
                                             kbd {
                                                 background-color: var(--vscode-keybindingLabel-background);
                                                 color: var(--vscode-keybindingLabel-foreground);
@@ -915,19 +1040,19 @@ class WebViewInstance(
                                                 vertical-align: middle;
                                                 padding: 1px 3px;
                                             }
-                                            
+
                                             ::-webkit-scrollbar {
                                                 width: 10px;
                                                 height: 10px;
                                             }
-                                            
+
                                             ::-webkit-scrollbar-corner {
                                                 background-color: var(--vscode-editor-background);
                                             }
-                                            
+
                                             *, *::before, *::after { box-sizing: border-box; }
                                             html, body { width: 100%; height: 100%; }
-                                            
+
                                             ::-webkit-scrollbar-thumb {
                                                 background-color: var(--vscode-scrollbarSlider-background);
                                             }
@@ -969,9 +1094,11 @@ class WebViewInstance(
 
                 // Pass the theme config without cssContent via message
                 val themeConfigJson = gson.toJson(themeConfigCopy)
+                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
                 val message = """
                     {
                         "type": "theme",
+                        "theme": "$assistantUITheme",
                         "text": "${themeConfigJson.replace("\"", "\\\"")}"
                     }
                 """.trimIndent()

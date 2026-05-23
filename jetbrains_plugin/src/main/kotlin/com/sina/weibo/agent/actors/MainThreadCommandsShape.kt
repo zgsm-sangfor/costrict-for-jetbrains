@@ -15,6 +15,7 @@ import com.sina.weibo.agent.diff.DiffViewRegistrar
 import com.sina.weibo.agent.editor.registerOpenEditorAPICommands
 import com.sina.weibo.agent.terminal.registerTerminalAPICommands
 import com.sina.weibo.agent.util.doInvokeMethod
+import com.sina.weibo.agent.webview.WebViewManager
 import kotlin.coroutines.Continuation
 
 /**
@@ -122,6 +123,17 @@ class MainThreadCommands(val project: Project) : MainThreadCommandsShape {
                     val key = args[0]?.toString() ?: ""
                     contextKeys[key] = args[1]
                     logger.info("setContext: $key = ${args[1]}")
+                    // When costrict.uiMode changes, propagate to WebViewManager so it
+                    // switches the tool window content to the correct WebView provider.
+                    if (key == "costrict.uiMode") {
+                        val mode = args[1]?.toString()
+                        try {
+                            val webViewManager = project.getService(WebViewManager::class.java)
+                            webViewManager.setUiMode(mode)
+                        } catch (e: Exception) {
+                            logger.warn("setContext(costrict.uiMode): failed to notify WebViewManager: ${e.message}")
+                        }
+                    }
                 }
                 return Unit
             }
