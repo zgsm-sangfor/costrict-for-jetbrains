@@ -15,6 +15,7 @@ import com.sina.weibo.agent.ipc.proxy.logger.FileRPCProtocolLogger
 import com.sina.weibo.agent.ipc.proxy.uri.IURITransformer
 import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ProxyConfigUtil
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -48,6 +49,12 @@ class RPCManager(
      * Send configuration and workspace information to extension process
      */
     suspend fun startInitialize() {
+        // Debug: log immediately when startInitialize is called
+        try {
+            java.io.File("/tmp/cos-cli-debug.log").appendText(
+                "[INIT] startInitialize() CALLED\n"
+            )
+        } catch (_: Exception) {}
         try {
             logger.info("Starting to initialize plugin environment")
             withContext(Dispatchers.IO) {
@@ -85,8 +92,15 @@ class RPCManager(
                 // so that settings like costrict.uiMode survive extension host restarts.
                 val persistedConfig = loadPersistedConfig()
                 val userLocalModel = if (persistedConfig.isNotEmpty()) {
+                    val nested = buildNestedContents(persistedConfig)
+                    // Debug: log what we are sending
+                    try {
+                        java.io.File("/tmp/cos-cli-debug.log").appendText(
+                            "[INIT] userLocal contents: ${com.google.gson.Gson().toJson(nested)}\n"
+                        )
+                    } catch (_: Exception) {}
                     mapOf(
-                        "contents" to buildNestedContents(persistedConfig),
+                        "contents" to nested,
                         "keys" to persistedConfig.keys.toList(),
                         "overrides" to emptyList<String>()
                     )
@@ -108,9 +122,12 @@ class RPCManager(
                     "folders" to emptyList<Any>(),
                     "configurationScopes" to emptyList<Any>()
                 )
-
-                // Directly call the interface method
-                extHostConfiguration.initializeConfiguration(emptyConfigModel)
+                // Directly call the interface method and wait for the RPC response
+                val initConfigResult = extHostConfiguration.initializeConfiguration(emptyConfigModel)
+                if (initConfigResult is CompletableDeferred<*>) {
+                    initConfigResult.await()
+                    logger.info("Configuration initialization RPC completed")
+                }
 
                 // Get ExtHostWorkspace proxy
                 val extHostWorkspace = rpcProtocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWorkspace)
@@ -120,12 +137,17 @@ class RPCManager(
                 val workspaceData = project.getService(WorkspaceManager::class.java).getCurrentWorkspaceData()
 
                 // If workspace data is obtained, send it to extension process, otherwise send null
-                if (workspaceData != null) {
+                // Wait for the workspace initialization RPC response as well
+                val initWorkspaceResult = if (workspaceData != null) {
                     logger.info("Sending workspace data to extension process: ${workspaceData.name}, folders: ${workspaceData.folders.size}")
                     extHostWorkspace.initializeWorkspace(workspaceData, true)
                 } else {
                     logger.info("No available workspace data, sending null to extension process")
                     extHostWorkspace.initializeWorkspace(null, true)
+                }
+                if (initWorkspaceResult is CompletableDeferred<*>) {
+                    initWorkspaceResult.await()
+                    logger.info("Workspace initialization RPC completed")
                 }
 
                 // Initialize workspace

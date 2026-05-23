@@ -40,6 +40,7 @@ import java.awt.Font
 import java.awt.Component
 import java.awt.Cursor
 import javax.swing.JButton
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.BorderFactory
@@ -771,23 +772,46 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         /**
-         * Add WebView component to UI
+         * Remove a specific WebView component from the panel.
+         * Called by WebViewManager when a different viewType provider registers.
+         */
+        override fun removeWebViewComponent(webView: WebViewInstance) {
+            logger.info("Removing WebView component from UI: ${webView.viewType}/${webView.viewId}")
+            val components = contentPanel.components
+            for (component in components) {
+                if (component === webView.browser.component) {
+                    contentPanel.remove(component)
+                    contentPanel.revalidate()
+                    contentPanel.repaint()
+                    logger.info("WebView component removed: ${webView.viewType}/${webView.viewId}")
+                    break
+                }
+            }
+        }
+
+        /**
+         * Add WebView component to UI, replacing any existing browser components.
+         * This prevents multiple JCEF browser instances from stacking in the tool window.
          */
         private fun addWebViewComponent(webView: WebViewInstance) {
             logger.info("Adding WebView component to UI: ${webView.viewType}/${webView.viewId}")
 
-            // Check if WebView component is already added
+            // Check if this exact component is already the only one in the panel
             val components = contentPanel.components
+            if (components.size == 1 && components[0] === webView.browser.component) {
+                logger.info("WebView component already exists and is the only component")
+                return
+            }
+
+            // Remove all non-placeholder browser components (keep placeholders like labels/buttons)
             for (component in components) {
-                if (component === webView.browser.component) {
-                    logger.info("WebView component already exists in UI")
-                    return
+                if (component is JComponent && component.parent === contentPanel) {
+                    contentPanel.remove(component)
                 }
             }
 
-            // Add WebView component without removing existing components
+            // Add the new WebView component
             contentPanel.add(webView.browser.component, BorderLayout.CENTER)
-
             setupDragAndDropSupport(webView)
 
             // Relayout
@@ -804,9 +828,10 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             logger.info("Hiding system info placeholder")
 
             // Remove all components from content panel except WebView component
+            val latestComponent = webViewManager.getLatestWebView()?.browser?.component
             val components = contentPanel.components
             for (component in components) {
-                if (component !== webViewManager.getLatestWebView()?.browser?.component) {
+                if (latestComponent == null || component !== latestComponent) {
                     contentPanel.remove(component)
                 }
             }

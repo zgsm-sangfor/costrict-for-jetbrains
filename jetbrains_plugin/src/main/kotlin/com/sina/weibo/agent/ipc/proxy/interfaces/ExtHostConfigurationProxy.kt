@@ -13,7 +13,7 @@ interface ExtHostConfigurationProxy {
      * Initialize configuration
      * @param configModel Configuration model
      */
-    fun initializeConfiguration(configModel: Map<String, Any?>)
+    fun initializeConfiguration(configModel: Map<String, Any?>): Any?
 
     /**
      * Accept configuration changed notification from main thread.

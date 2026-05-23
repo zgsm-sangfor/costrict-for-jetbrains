@@ -52,6 +52,13 @@ interface WebViewCreationCallback {
      * @param instance Created WebView instance
      */
     fun onWebViewCreated(instance: WebViewInstance)
+
+    /**
+     * Called to remove a WebViewInstance's browser component from the UI panel.
+     * Implementations that manage a tool window panel should override this to
+     * remove the browser component. The default implementation is a no-op.
+     */
+    fun removeWebViewComponent(instance: WebViewInstance) {}
 }
 
 /**
@@ -316,67 +323,124 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     }
     
     /**
-     * Register WebView provider and create WebView instance
+     * Register WebView provider and create WebView instance.
+     *
+     * If a WebViewInstance for a *different* viewType already exists, the old one
+     * is removed from the panel and disposed before the new one is created.
+     * This prevents multiple JCEF browser components from stacking in the tool window
+     * when both classic and cloud providers are registered (e.g. in IDEA plugin).
      */
     fun registerProvider(data: WebviewViewProviderData) {
         logger.debug("Register WebView provider and create WebView instance: ${data.viewType}")
+
+        // ── Clean up stale WebViewInstances left behind by extension-host reloads ──
+        // When the VSCode extension host restarts (e.g. after switching UI mode) the
+        // old providers are killed without a proper unregister, leaving disposed
+        // WebViewInstances in our maps.  Re-using them causes HTML updates to be
+        // silently ignored because loadUrl/loadHtml check isDisposed.
+        val staleViewTypes = viewTypeToWebview.filter { it.value.isDisposed() }.keys.toList()
+        for (staleViewType in staleViewTypes) {
+            viewTypeToWebview.remove(staleViewType)
+        }
+        val staleHandles = handleToWebview.filter { it.value.isDisposed() }.keys.toList()
+        for (staleHandle in staleHandles) {
+            handleToWebview.remove(staleHandle)
+        }
+        if (latestWebView?.isDisposed() == true) {
+            latestWebView = null
+        }
+
+        // ── Dispose existing WebViewInstance of a different viewType ──
+        val existingDifferentViewType = viewTypeToWebview.entries.firstOrNull { it.key != data.viewType }
+        if (existingDifferentViewType != null) {
+            val oldViewType = existingDifferentViewType.key
+            val oldInstance = existingDifferentViewType.value
+            logger.info("registerProvider: disposing old WebViewInstance for different viewType=$oldViewType (new=$data.viewType)")
+
+            // Remove old browser component from the panel
+            removeBrowserComponentFromPanel(oldInstance)
+
+            // Remove from routing maps
+            viewTypeToWebview.remove(oldViewType)
+            handleToWebview.entries.removeAll { it.value == oldInstance }
+            if (latestWebView == oldInstance) {
+                latestWebView = null
+            }
+
+            // Dispose JCEF browser resources
+            Disposer.dispose(oldInstance)
+        }
+
+        // ── If the same viewType already exists, re-resolve it ──
+        val existing = viewTypeToWebview[data.viewType]
+        if (existing != null) {
+            logger.debug("registerProvider: WebViewInstance already exists for viewType=${data.viewType}, re-resolving")
+            val proxy = project.getService(PluginContext::class.java).getRPCProtocol()
+                ?.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
+            if (proxy != null) {
+                proxy.resolveWebviewView(
+                    existing.viewId, data.viewType,
+                    data.options["title"] as? String ?: data.viewType,
+                    data.options["state"] as? Map<String, Any?> ?: emptyMap<String, Any?>(), null
+                )
+            }
+            latestWebView = existing
+            return
+        }
+
+        // ── Set resource root directory from extension ──
         val extension = data.extension
-        
-        // Get location info from extension and set resource root directory
         try {
             @Suppress("UNCHECKED_CAST")
             val location = extension?.get("location") as? Map<String, Any?>
             val fsPath = location?.get("fsPath") as? String
-            
             if (fsPath != null) {
-                // Set resource root directory
                 val path = Paths.get(fsPath)
                 logger.debug("Get resource directory path from extension: $path")
-                
-                // Ensure the resource directory exists
                 if (!path.exists()) {
                     path.createDirectories()
                 }
-                
-                 // Update resource root directory
                 resourceRootDir = path
-                
-                // Initialize theme manager
                 initializeThemeManager(fsPath)
-
             }
         } catch (e: Exception) {
             logger.error("Failed to get resource directory from extension", e)
         }
 
+        // ── Create new WebViewInstance ──
         val protocol = project.getService(PluginContext::class.java).getRPCProtocol()
         if (protocol == null) {
             logger.error("Cannot get RPC protocol instance, cannot register WebView provider: ${data.viewType}")
             return
         }
-        // When registration event is notified, create a new WebView instance
-        val viewId = UUID.randomUUID().toString()
 
+        val viewId = UUID.randomUUID().toString()
         val title = data.options["title"] as? String ?: data.viewType
         val state = data.options["state"] as? Map<String, Any?> ?: emptyMap()
-        
-        val webview = WebViewInstance(data.viewType, viewId, title, state,project,data.extension)
+        val webview = WebViewInstance(data.viewType, viewId, title, state, project, data.extension)
 
         val proxy = protocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
         proxy.resolveWebviewView(viewId, data.viewType, title, state, null)
 
-
-        // Set as the latest created WebView
         latestWebView = webview
-        // Store for handle-based routing (viewId is the TS-side handle)
         handleToWebview[viewId] = webview
-        // Store for viewType-based routing
         viewTypeToWebview[data.viewType] = webview
-        
-        logger.debug("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
 
-        // Notify callback
+        logger.debug("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
         notifyWebViewCreated(webview)
+    }
+
+    /**
+     * Find and remove a WebViewInstance's browser component from the tool window panel.
+     * Searches via the registered creation callbacks (which include RunVSAgentToolWindowContent).
+     */
+    private fun removeBrowserComponentFromPanel(instance: WebViewInstance) {
+        val callbacks = synchronized(creationCallbacks) { creationCallbacks.toList() }
+        ApplicationManager.getApplication().invokeLater {
+            for (callback in callbacks) {
+                callback.removeWebViewComponent(instance)
+            }
+        }
     }
     
     /**
@@ -662,6 +726,9 @@ class WebViewInstance(
     
     // WebView state
     private var isDisposed = false
+
+    /** @return true if this WebViewInstance has already been disposed. */
+    fun isDisposed(): Boolean = isDisposed
 
     // JavaScript query handler for communication with webview
     var jsQuery: JBCefJSQuery? = null

@@ -161,8 +161,19 @@ class MainThreadConfiguration(private val project: Project? = null) : MainThread
             getConfigFilePath().writeText(
                 com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(persistedConfig)
             )
+            // Also write to a file-based debug log
+            try {
+                java.io.File("/tmp/cos-cli-debug.log").appendText(
+                    "[CONFIG] savePersistedConfig done, uiMode=${persistedConfig["costrict.uiMode"]}\n"
+                )
+            } catch (_: Exception) {}
         } catch (e: Exception) {
             logger.error("Failed to save config.json: ${e.message}", e)
+            try {
+                java.io.File("/tmp/cos-cli-debug.log").appendText(
+                    "[CONFIG] savePersistedConfig FAILED: ${e.message}\n"
+                )
+            } catch (_: Exception) {}
         }
     }
 
@@ -213,9 +224,15 @@ class MainThreadConfiguration(private val project: Project? = null) : MainThread
         val configOverrides = convertToConfigurationOverrides(overrides)
         
         // Log the configuration update for debugging purposes
-        logger.debug("Update configuration option: target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value, " +
+        logger.info("Update configuration option: target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value, " +
                    "overrideIdentifier=${configOverrides?.overrideIdentifier}, resource=${configOverrides?.resource}, " +
                    "scopeToLanguage=$scopeToLanguage")
+        // Also write to a file-based debug log for tracing the RPC flow
+        try {
+            java.io.File("/tmp/cos-cli-debug.log").appendText(
+                "[CONFIG] updateConfigurationOption called target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value\n"
+            )
+        } catch (_: Exception) {}
         
         // Build the complete configuration key including overrides and language scoping
         val fullKey = buildConfigurationKey(key, configOverrides, scopeToLanguage)
@@ -250,7 +267,6 @@ class MainThreadConfiguration(private val project: Project? = null) : MainThread
                 storeValue(properties, memoryPrefixedKey, value)
             }
         }
-
         // Also persist to ~/.costrict-jetbrains/config.json so that the
         // extension host can reload it on next restart. This mirrors what
         // rpcManager.ts does in its local $updateConfigurationOption handler.
@@ -260,7 +276,15 @@ class MainThreadConfiguration(private val project: Project? = null) : MainThread
             persistedConfig[fullKey] = value
         }
         savePersistedConfig()
-        syncToExtensionHost(listOf(key))
+        // NOTE: syncToExtensionHost is intentionally omitted here. The
+        // $updateConfigurationOption RPC originates FROM the ExtHost, so it
+        // already has the updated value in its in-memory model. Calling
+        // acceptConfigurationChanged back would (a) create a re-entrant RPC
+        // during request handling which can deadlock / time-out, and (b) send
+        // a configuration model with EMPTY defaults that overwrites the
+        // initialization model (losing e.g. workbench.colorTheme). The
+        // persisted config.json is the source-of-truth across restarts –
+        // RPCManager.startInitialize() will reload it on the next launch.
     }
     
     /**
@@ -317,14 +341,16 @@ class MainThreadConfiguration(private val project: Project? = null) : MainThread
             }
         }
 
-        // Also remove from persisted config and sync to extension host
+        // Also remove from persisted config.
         if (overrides.isNullOrEmpty() && scopeToLanguage != true) {
             persistedConfig.remove(key)
         } else {
             persistedConfig.remove(fullKey)
         }
         savePersistedConfig()
-        syncToExtensionHost(listOf(key))
+        // NOTE: syncToExtensionHost is intentionally omitted – same reasoning
+        // as updateConfigurationOption above. The ExtHost already knows about
+        // the removal because it initiated the $removeConfigurationOption RPC.
     }
     
     /**
