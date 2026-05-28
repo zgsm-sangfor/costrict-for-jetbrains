@@ -22,6 +22,7 @@ import com.sina.weibo.agent.events.WebviewViewProviderData
 import com.sina.weibo.agent.ipc.proxy.SerializableObjectWithBuffers
 import com.sina.weibo.agent.theme.ThemeChangeListener
 import com.sina.weibo.agent.theme.ThemeManager
+import com.sina.weibo.agent.util.ConfigFileUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -813,9 +814,11 @@ class WebViewInstance(
     val extension: Map<String, Any?>
 ) : Disposable {
     private val logger = Logger.getInstance(WebViewInstance::class.java)
-    
+
     // JCEF browser instance
-    val browser = JBCefBrowser.createBuilder().setOffScreenRendering(true).build()
+    val browser = JBCefBrowser.createBuilder()
+        .setOffScreenRendering(ConfigFileUtils.isWebViewOffscreenRenderingEnabled())
+        .build()
     
     // WebView state
     private var isDisposed = false
@@ -837,7 +840,7 @@ class WebViewInstance(
     private var currentThemeConfig: JsonObject? = null
     
     // Callback for page load completion
-    private var pageLoadCallback: (() -> Unit)? = null
+    private var pageLoadCallback: ((success: Boolean, errorInfo: String?) -> Unit)? = null
     
     init {
         setupJSBridge()
@@ -869,7 +872,7 @@ class WebViewInstance(
      * Set callback for page load completion
      * @param callback Callback function to be called when page is loaded
      */
-    fun setPageLoadCallback(callback: (() -> Unit)?) {
+    fun setPageLoadCallback(callback: ((success: Boolean, errorInfo: String?) -> Unit)?) {
         pageLoadCallback = callback
     }
     
@@ -1183,8 +1186,12 @@ class WebViewInstance(
                     source: String?,
                     line: Int
                 ): Boolean {
-                    logger.debug("WebView console message: [$level] $message (line: $line, source: $source)")
-                    return true
+                    val logMessage = "WebView console message: [$level] $message (line: $line, source: $source, viewType=$viewType, viewId=$viewId)"
+                    when (level?.name) {
+                        "LOGSEVERITY_ERROR", "LOGSEVERITY_WARNING" -> logger.warn(logMessage)
+                        else -> logger.info(logMessage)
+                    }
+                    return false
                 }
             }, browser.cefBrowser)
             
@@ -1204,22 +1211,38 @@ class WebViewInstance(
                     frame: CefFrame?,
                     transitionType: CefRequest.TransitionType?
                 ) {
-                    logger.debug("WebView started loading: ${frame?.url}, transition type: $transitionType")
-                    isPageLoaded = false
+                    logger.info("WebView started loading: url=${frame?.url}, transitionType=$transitionType, viewType=$viewType, viewId=$viewId")
+                    if (frame?.isMain == true) {
+                        isPageLoaded = false
+                    }
                 }
-                
+
                 override fun onLoadEnd(
                     browser: CefBrowser?,
                     frame: CefFrame?,
                     httpStatusCode: Int
                 ) {
-                    logger.debug("WebView finished loading: ${frame?.url}, status code: $httpStatusCode")
-                    isPageLoaded = true
-                    injectTheme()
-                    // Notify page load completion
-                    pageLoadCallback?.invoke()
+                    val url = frame?.url
+                    val isMainFrame = frame?.isMain == true
+                    logger.info("WebView finished loading: url=$url, statusCode=$httpStatusCode, isMainFrame=$isMainFrame, viewType=$viewType, viewId=$viewId")
+
+                    if (!isMainFrame) {
+                        return
+                    }
+
+                    val success = httpStatusCode in 200..399 || httpStatusCode == 0
+                    if (success) {
+                        isPageLoaded = true
+                        injectTheme()
+                        pageLoadCallback?.invoke(true, null)
+                    } else {
+                        isPageLoaded = false
+                        val errorInfo = "HTTP $httpStatusCode while loading $url"
+                        logger.warn("WebView main frame load completed with error: $errorInfo, viewType=$viewType, viewId=$viewId")
+                        pageLoadCallback?.invoke(false, errorInfo)
+                    }
                 }
-                
+
                 override fun onLoadError(
                     browser: CefBrowser?,
                     frame: CefFrame?,
@@ -1227,7 +1250,14 @@ class WebViewInstance(
                     errorText: String?,
                     failedUrl: String?
                 ) {
-                    logger.debug("WebView load error: $failedUrl, error code: $errorCode, error message: $errorText")
+                    val frameUrl = frame?.url
+                    val isMainFrame = frame?.isMain == true
+                    val errorInfo = "CEF load error $errorCode: $errorText, failedUrl=$failedUrl, frameUrl=$frameUrl"
+                    logger.warn("WebView load error: $errorInfo, isMainFrame=$isMainFrame, viewType=$viewType, viewId=$viewId")
+                    if (isMainFrame) {
+                        isPageLoaded = false
+                        pageLoadCallback?.invoke(false, errorInfo)
+                    }
                 }
             }, browser.cefBrowser)
             client.addRequestHandler(object : CefRequestHandlerAdapter() {

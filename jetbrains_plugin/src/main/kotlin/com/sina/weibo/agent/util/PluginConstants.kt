@@ -44,6 +44,12 @@ object PluginConstants {
          * Debug resource configuration key
          */
         const val DEBUG_RESOURCE_KEY = "debug.resource"
+
+        /**
+         * Toggle JCEF offscreen rendering for WebView instances.
+         * Defaults to true to preserve existing rendering behavior.
+         */
+        const val WEBVIEW_OFFSCREEN_RENDERING_KEY = "webview.offscreen.rendering"
         
         /**
          * Get user home directory for configuration storage

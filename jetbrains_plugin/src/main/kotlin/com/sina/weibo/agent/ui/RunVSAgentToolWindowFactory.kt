@@ -670,15 +670,19 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
                     addWebViewComponent(webView)
                 }
                 // Set page load callback to hide system info only after page is loaded
-                webView.setPageLoadCallback {
+                webView.setPageLoadCallback { success, errorInfo ->
                     ApplicationManager.getApplication().invokeLater {
-                        hideSystemInfo()
+                        if (success) {
+                            hideSystemInfo(webView)
+                        } else {
+                            showWebViewLoadError(webView, errorInfo)
+                        }
                     }
                 }
                 // If page is already loaded, hide system info immediately
                 if (webView.isPageLoaded()) {
                     ApplicationManager.getApplication().invokeLater {
-                        hideSystemInfo()
+                        hideSystemInfo(webView)
                     }
                 }
             }?:webViewManager.addCreationCallback(this, toolWindow.disposable)
@@ -763,10 +767,14 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
                 addWebViewComponent(instance)
             }
             // Set page load callback to hide system info only after page is loaded
-            instance.setPageLoadCallback {
+            instance.setPageLoadCallback { success, errorInfo ->
                 // Ensure UI update in EDT thread
                 ApplicationManager.getApplication().invokeLater {
-                    hideSystemInfo()
+                    if (success) {
+                        hideSystemInfo(instance)
+                    } else {
+                        showWebViewLoadError(instance, errorInfo)
+                    }
                 }
             }
         }
@@ -822,16 +830,59 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         /**
+         * Show WebView load failure details instead of leaving a blank browser panel.
+         */
+        private fun showWebViewLoadError(webView: WebViewInstance, errorInfo: String?) {
+            logger.warn("Showing WebView load error for ${webView.viewType}/${webView.viewId}: $errorInfo")
+
+            val currentWebView = webViewManager.getLatestWebView()
+            if (currentWebView !== webView) {
+                logger.info("Ignoring load error for non-current WebView: ${webView.viewType}/${webView.viewId}")
+                return
+            }
+
+            contentPanel.removeAll()
+
+            val message = buildString {
+                append("<html><body style='padding:16px;'>")
+                append("<h3>WebView 加载失败</h3>")
+                append("<p>Cloud UI 未能正常加载，请查看 IDEA idea.log 中的 WebView load error 或 Local WebView resource 日志。</p>")
+                if (!errorInfo.isNullOrBlank()) {
+                    append("<p><b>错误信息：</b><br/>")
+                    append(escapeHtml(errorInfo))
+                    append("</p>")
+                }
+                append("<p>如果资源加载日志正常但仍灰屏，可在 ~/.costrict-jetbrains/.vscode-agent 设置 webview.offscreen.rendering=false 后重启 IDEA 验证。</p>")
+                append("</body></html>")
+            }
+
+            contentPanel.add(JLabel(message), BorderLayout.CENTER)
+            contentPanel.add(buttonPanel, BorderLayout.SOUTH)
+            contentPanel.revalidate()
+            contentPanel.repaint()
+        }
+
+        private fun escapeHtml(value: String): String {
+            return value
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;")
+        }
+
+        /**
          * Hide system info placeholder
          */
-        private fun hideSystemInfo() {
+        private fun hideSystemInfo(webView: WebViewInstance? = null) {
             logger.info("Hiding system info placeholder")
 
-            // Remove all components from content panel except WebView component
-            val latestComponent = webViewManager.getLatestWebView()?.browser?.component
+            val webViewComponent = webView?.browser?.component ?: contentPanel.components.firstOrNull {
+                it.javaClass.name.contains("JBCef", ignoreCase = true) || it.javaClass.name.contains("Cef", ignoreCase = true)
+            }
             val components = contentPanel.components
             for (component in components) {
-                if (latestComponent == null || component !== latestComponent) {
+                if (webViewComponent == null || component !== webViewComponent) {
                     contentPanel.remove(component)
                 }
             }

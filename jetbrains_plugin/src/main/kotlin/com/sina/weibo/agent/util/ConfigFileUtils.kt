@@ -19,6 +19,10 @@ object ConfigFileUtils {
         val currentExtensionId = properties.getProperty(PluginConstants.ConfigFiles.EXTENSION_TYPE_KEY)
         return currentExtensionId
     }
+
+    fun isWebViewOffscreenRenderingEnabled(): Boolean {
+        return getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_OFFSCREEN_RENDERING_KEY, "true")?.toBoolean() ?: true
+    }
     
     /**
      * Ensure configuration directory exists
