@@ -511,7 +511,25 @@ class ExtensionProcessManager : Disposable {
     private fun findNodeExecutable(): String? {
         LOG.info("Starting Node.js detection...")
         
-        // First check built-in Node.js in plugin resources
+        // Highest priority: check COSTRICT_IDEA_NODE_PATH environment variable
+        val customNodePath = System.getenv(PluginConstants.ENV_NODE_PATH)
+        if (!customNodePath.isNullOrBlank()) {
+            LOG.info("Found ${PluginConstants.ENV_NODE_PATH} environment variable: $customNodePath")
+            val customNodeFile = File(customNodePath)
+            val isExecutable = if (SystemInfo.isWindows) {
+                customNodeFile.exists() && customNodeFile.isFile
+            } else {
+                customNodeFile.exists() && customNodeFile.canExecute()
+            }
+            if (isExecutable) {
+                LOG.info("Using custom Node.js from ${PluginConstants.ENV_NODE_PATH}: ${customNodeFile.absolutePath}")
+                return customNodeFile.absolutePath
+            } else {
+                LOG.warn("${PluginConstants.ENV_NODE_PATH} is set to '$customNodePath' but the file does not exist or is not executable")
+            }
+        }
+        
+        // Then check built-in Node.js in plugin resources
         val resourcesPath = PluginResourceUtil.getResourcePath(PLUGIN_ID, NODE_MODULES_PATH)
         if (resourcesPath != null) {
             val resourceDir = File(resourcesPath)

@@ -8,6 +8,7 @@ object EnvWhitelist {
         "GOROOT",
         "GOPATH",
         "LANG",
+        "COSTRICT_IDEA_NODE_PATH",
     )
 
     private val PREFIX_KEYS = listOf(

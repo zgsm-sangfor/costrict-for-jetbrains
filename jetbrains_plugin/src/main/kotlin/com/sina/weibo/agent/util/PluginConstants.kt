@@ -11,6 +11,12 @@ object PluginConstants {
     const val RUNTIME_DIR = "runtime"
 
     /**
+     * Environment variable name for specifying a custom Node.js executable path.
+     * When set, this path takes the highest priority in Node.js detection.
+     */
+    const val ENV_NODE_PATH = "COSTRICT_IDEA_NODE_PATH"
+
+    /**
      * Configuration file constants
      */
     object ConfigFiles {
