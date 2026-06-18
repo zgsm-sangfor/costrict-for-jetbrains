@@ -17,7 +17,9 @@ import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ProxyConfigUtil
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.File
 
 /**
@@ -122,10 +124,12 @@ class RPCManager(
                     "folders" to emptyList<Any>(),
                     "configurationScopes" to emptyList<Any>()
                 )
-                // Directly call the interface method and wait for the RPC response
+                // Directly call the interface method and wait for the RPC response.
+                // Guard each await with a timeout: if the extension host hangs during
+                // initialization the plugin would otherwise stay in "loading" forever.
                 val initConfigResult = extHostConfiguration.initializeConfiguration(emptyConfigModel)
                 if (initConfigResult is CompletableDeferred<*>) {
-                    initConfigResult.await()
+                    withTimeout(INIT_RPC_TIMEOUT_MS) { initConfigResult.await() }
                     logger.info("Configuration initialization RPC completed")
                 }
 
@@ -146,12 +150,25 @@ class RPCManager(
                     extHostWorkspace.initializeWorkspace(null, true)
                 }
                 if (initWorkspaceResult is CompletableDeferred<*>) {
-                    initWorkspaceResult.await()
+                    withTimeout(INIT_RPC_TIMEOUT_MS) { initWorkspaceResult.await() }
                     logger.info("Workspace initialization RPC completed")
                 }
 
                 // Initialize workspace
                 logger.info("Workspace initialization completed")
+            }
+        } catch (e: TimeoutCancellationException) {
+            // Initialization RPC did not respond in time. Surface the failure to the
+            // tool window UI via lastInitializationFailure so the user sees an error
+            // state instead of an indefinite "Initializing..." screen. Do not auto-retry.
+            logger.error("Plugin initialization timed out after ${INIT_RPC_TIMEOUT_MS}ms waiting for extension host RPC", e)
+            try {
+                com.sina.weibo.agent.plugin.WecoderPlugin.getInstance(project).recordInitializationFailure(
+                    com.sina.weibo.agent.core.ExtensionProcessManager.StartFailureReason.PROCESS_START_EXCEPTION,
+                    "Initialization timed out waiting for extension host RPC (${INIT_RPC_TIMEOUT_MS}ms). The extension host may be unresponsive."
+                )
+            } catch (reportErr: Exception) {
+                logger.warn("Failed to record initialization timeout failure to UI", reportErr)
             }
         } catch (e: Exception) {
             logger.error("Failed to initialize plugin environment: ${e.message}", e)
@@ -330,6 +347,13 @@ class RPCManager(
     companion object {
         private const val CONFIG_DIR_NAME = ".costrict-jetbrains"
         private const val CONFIG_FILE_NAME = "config.json"
+
+        /**
+         * Per-RPC-call timeout for initialization awaits (config + workspace).
+         * 15s is generous for a local extension host; if exceeded we treat the
+         * extension host as hung and surface a failure instead of hanging forever.
+         */
+        private const val INIT_RPC_TIMEOUT_MS = 15_000L
 
         /**
          * Load persisted configuration from ~/.costrict-jetbrains/config.json.

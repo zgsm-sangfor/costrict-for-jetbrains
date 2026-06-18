@@ -115,10 +115,20 @@ class MainThreadWebviews(val project: Project) : MainThreadWebviewsShape {
         return try {
             val mangler = project.getService(WebViewManager::class.java)
 
-            // Use viewType-aware lookup when available, fall back to latestWebView
-            val viewType = extractViewTypeFromHandle(handle)
-            val target = if (viewType != null) mangler.getWebViewByViewType(viewType) else mangler.getLatestWebView()
-            target?.postMessageToWebView(value)
+            // Route by the full handle first (the UUID the ext host echoes back from
+            // $resolveWebviewView). This matches updateWebViewHtml's lookup and is the
+            // only lookup that is correct in multi-project scenarios: getWebViewByViewType
+            // / latestWebView fall back to whichever webview registered last, which can be
+            // a different webview when two project windows are open, causing proxyFetch
+            // responses to be delivered to the wrong webview and silently dropped.
+            val target = mangler.getWebViewByHandle(handle)
+                ?: mangler.getWebViewByViewType(extractViewTypeFromHandle(handle) ?: "")
+                ?: mangler.getLatestWebView()
+            if (target == null) {
+                logger.warn("postMessage: no target WebView for handle=$handle, dropping message")
+            } else {
+                target.postMessageToWebView(value)
+            }
             true
         } catch (e: Exception) {
             logger.error("Failed to send message to Webview: $e")

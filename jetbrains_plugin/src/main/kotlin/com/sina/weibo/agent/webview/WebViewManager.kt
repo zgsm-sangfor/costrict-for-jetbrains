@@ -69,6 +69,11 @@ interface WebViewCreationCallback {
 class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     private val logger = Logger.getInstance(WebViewManager::class.java)
 
+    private companion object {
+        /** Cloud UI (Assistant UI) sidebar viewType. */
+        const val CLOUD_VIEW_TYPE = "costrict.AssistantUISidebarProvider"
+    }
+
     // Latest created WebView instance
     @Volatile
     private var latestWebView: WebViewInstance? = null
@@ -495,6 +500,17 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     }
 
     /**
+     * Look up a WebView by its full handle (the UUID minted at registerProvider,
+     * echoed back by the ext host in $setHtml / $postMessage). This is the precise
+     * routing key for response messages: unlike getWebViewByViewType it does NOT
+     * fall back to latestWebView, so it is safe in multi-project scenarios where
+     * latestWebView may belong to a different webview.
+     */
+    fun getWebViewByHandle(handle: String): WebViewInstance? {
+        return handleToWebview[handle]
+    }
+
+    /**
      * Set the current UI mode and switch the visible WebView accordingly.
      * Called from MainThreadCommands when setContext("costrict.uiMode", ...) is
      * executed by the extension.
@@ -511,6 +527,34 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
      * Get the current UI mode.
      */
     fun getUiMode(): String? = uiMode
+
+    /**
+     * Reload the cloud UI webview so it reconnects to the cs-cloud daemon.
+     *
+     * Called when the extension-host socket dies: all cloud UI API calls are
+     * proxied through the extension host, so a socket loss leaves the UI in a
+     * state where every request hangs forever and user retries do nothing.
+     * Reloading the page re-runs the bootstrap script (which re-installs the
+     * fetch override) and lets the UI talk to cs-cloud again, because cs-cloud
+     * runs as a detached daemon independent of the extension host socket.
+     *
+     * Safe to call from any thread; the actual JCEF load is scheduled on EDT.
+     */
+    fun reloadCloudWebView() {
+        val cloudWebView = getWebViewByViewType(CLOUD_VIEW_TYPE)
+        if (cloudWebView == null || cloudWebView.isDisposed()) {
+            logger.info("reloadCloudWebView: cloud webview not available (null or disposed), skipping reload")
+            return
+        }
+        logger.info("reloadCloudWebView: scheduling reload of cloud webview ${cloudWebView.viewType}/${cloudWebView.viewId}")
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                cloudWebView.reloadLastUrl()
+            } catch (e: Exception) {
+                logger.error("reloadCloudWebView: failed to reload cloud webview", e)
+            }
+        }
+    }
 
     /**
      * Switch the tool window to show the WebView that matches the current mode.
@@ -836,6 +880,13 @@ class WebViewInstance(
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var isPageLoaded = false
+
+    // Last URL successfully passed to loadUrl(). Used by reloadLastUrl() to
+    // re-load the current page (e.g. after the extension-host socket dies and
+    // the cloud UI must reconnect to the still-running cs-cloud daemon without
+    // going through the TS message bridge).
+    @Volatile
+    private var lastLoadedUrl: String? = null
 
     private var currentThemeConfig: JsonObject? = null
     
@@ -1308,6 +1359,27 @@ class WebViewInstance(
     fun loadUrl(url: String) {
         if (!isDisposed) {
             logger.debug("WebView loading URL: $url")
+            lastLoadedUrl = url
+            browser.loadURL(url)
+        }
+    }
+
+    /**
+     * Reload the last URL passed to loadUrl(), if any. Used to recover the
+     * cloud UI after the extension-host socket dies: re-running the page
+     * bootstrap re-executes the fetch override so the UI reconnects to the
+     * cs-cloud daemon (which runs as an independent process and survives the
+     * socket loss). No-op if nothing was loaded yet or the instance is disposed.
+     */
+    fun reloadLastUrl() {
+        val url = lastLoadedUrl
+        if (url == null) {
+            logger.info("reloadLastUrl: no previous URL to reload for $viewType/$viewId")
+            return
+        }
+        if (!isDisposed) {
+            logger.info("reloadLastUrl: reloading $viewType/$viewId from $url")
+            isPageLoaded = false
             browser.loadURL(url)
         }
     }
