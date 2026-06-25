@@ -18,7 +18,7 @@ interface ExtHostWorkspaceProxy {
      * @param workspace Workspace configuration
      * @param trusted Whether trusted
      */
-    fun initializeWorkspace(workspace: WorkspaceData?, trusted: Boolean)
+    fun initializeWorkspace(workspace: WorkspaceData?, trusted: Boolean): Any?
 
     /**
      * Accept workspace data

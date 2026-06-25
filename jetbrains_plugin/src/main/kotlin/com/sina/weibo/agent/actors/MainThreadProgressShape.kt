@@ -15,25 +15,25 @@ import com.intellij.openapi.diagnostic.Logger
  * JetBrains-side progress UI support is implemented incrementally.
  */
 interface MainThreadProgressShape : Disposable {
-    fun `$startProgress`(handle: Int, options: Map<String, Any?>?, extensionId: String?): Any?
-    fun `$progressReport`(handle: Int, message: Any?): Any?
-    fun `$progressEnd`(handle: Int): Any?
+    fun startProgress(handle: Int, options: Map<String, Any?>?, extensionId: String?): Any?
+    fun progressReport(handle: Int, message: Any?): Any?
+    fun progressEnd(handle: Int): Any?
 }
 
 class MainThreadProgress : MainThreadProgressShape {
     private val logger = Logger.getInstance(MainThreadProgress::class.java)
 
-    override fun `$startProgress`(handle: Int, options: Map<String, Any?>?, extensionId: String?): Any? {
+    override fun startProgress(handle: Int, options: Map<String, Any?>?, extensionId: String?): Any? {
         logger.info("[Progress] start handle=$handle extensionId=$extensionId options=$options")
         return null
     }
 
-    override fun `$progressReport`(handle: Int, message: Any?): Any? {
+    override fun progressReport(handle: Int, message: Any?): Any? {
         logger.debug("[Progress] report handle=$handle message=$message")
         return null
     }
 
-    override fun `$progressEnd`(handle: Int): Any? {
+    override fun progressEnd(handle: Int): Any? {
         logger.info("[Progress] end handle=$handle")
         return null
     }

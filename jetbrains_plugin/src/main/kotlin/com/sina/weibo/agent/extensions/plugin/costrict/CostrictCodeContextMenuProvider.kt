@@ -68,21 +68,21 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class ExplainCodeAction : AnAction("Explain Code") {
         private val logger: Logger = Logger.getInstance(ExplainCodeAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
             args["startLine"] = effectiveRange.startLine + 1
             args["endLine"] = effectiveRange.endLine + 1
-            
+
             CostrictCodeContextMenuProvider.handleCodeAction("costrict.explainCode.InCurrentTask", "EXPLAIN", args, project)
         }
     }
@@ -93,21 +93,21 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class FixCodeAction : AnAction("Fix Code") {
         private val logger: Logger = Logger.getInstance(FixCodeAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
             args["startLine"] = effectiveRange.startLine + 1
             args["endLine"] = effectiveRange.endLine + 1
-            
+
             CostrictCodeContextMenuProvider.handleCodeAction("costrict.fixCode.InCurrentTask", "FIX", args, project)
         }
     }
@@ -118,21 +118,21 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class FixLogicAction : AnAction("Fix Logic") {
         private val logger: Logger = Logger.getInstance(FixLogicAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
             args["startLine"] = effectiveRange.startLine + 1
             args["endLine"] = effectiveRange.endLine + 1
-            
+
             CostrictCodeContextMenuProvider.handleCodeAction("costrict.fixCode.InCurrentTask", "FIX", args, project)
         }
     }
@@ -143,21 +143,21 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class ImproveCodeAction : AnAction("Improve Code") {
         private val logger: Logger = Logger.getInstance(ImproveCodeAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
             args["startLine"] = effectiveRange.startLine + 1
             args["endLine"] = effectiveRange.endLine + 1
-            
+
             CostrictCodeContextMenuProvider.handleCodeAction("costrict.improveCode.InCurrentTask", "IMPROVE", args, project)
         }
     }
@@ -168,21 +168,21 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class AddToContextAction : AnAction("Add to Context") {
         private val logger: Logger = Logger.getInstance(AddToContextAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
             args["startLine"] = effectiveRange.startLine + 1
             args["endLine"] = effectiveRange.endLine + 1
-            
+
             CostrictCodeContextMenuProvider.handleCodeAction("costrict.addToContext", "ADD_TO_CONTEXT", args, project)
         }
     }
@@ -218,15 +218,15 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
      */
     class CodeReviewAction : AnAction("Code Review") {
         private val logger: Logger = Logger.getInstance(CodeReviewAction::class.java)
-        
+
         override fun actionPerformed(e: AnActionEvent) {
             val project = e.project ?: return
             val editor = e.getData(CommonDataKeys.EDITOR) ?: return
             val file = e.dataContext.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
-            
+
             val effectiveRange = CostrictCodeContextMenuProvider.getEffectiveRange(editor)
             if (effectiveRange == null) return
-            
+
             val args = mutableMapOf<String, Any?>()
             args["filePath"] = file.path
             args["selectedText"] = effectiveRange.text
@@ -234,9 +234,31 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
             args["endLine"] = effectiveRange.endLine + 1
 
             project.getService(CommentManager::class.java)?.clearAllThreads()
-            
-            logger.info("🔍 Triggering code review with command: costrict.codeReviewJetbrains")
-            executeCommand("costrict.codeReviewJetbrains", project, args)
+
+            val webViewManager = project.getService(WebViewManager::class.java)
+            val isCloud = webViewManager.getUiMode() == "cloud"
+
+            if (isCloud) {
+                // Cloud mode: the registered costrict.codeReviewJetbrains command
+                // only routes to the classic controller unless the extension is
+                // rebuilt with the cloud branch. Deliver the review prompt directly
+                // via the assistantUIContext channel (matching cloudReviewController),
+                // so the action works without an extension rebuild.
+                logger.info("🔍 Triggering cloud code review via assistantUIContext")
+                val promptText = CostrictCodeSupportPrompt.create("ADD_TO_CONTEXT", args)
+                val message = mapOf<String, Any?>(
+                    "type" to "assistantUIContext",
+                    "text" to "/review $promptText",
+                    "focus" to true,
+                    "newThread" to true,
+                    "autoSend" to true
+                )
+                val messageJson = com.google.gson.Gson().toJson(message)
+                webViewManager.getLatestWebView()?.postMessageToWebView(messageJson)
+            } else {
+                logger.info("🔍 Triggering code review with command: costrict.codeReviewJetbrains")
+                executeCommand("costrict.codeReviewJetbrains", project, args)
+            }
         }
     }
 
@@ -285,69 +307,79 @@ class CostrictCodeContextMenuProvider : ExtensionContextMenuProvider {
          * @param project The current project
          */
         fun handleCodeAction(command: String, promptType: String, params: Any, project: Project?) {
-            val latestWebView = project?.getService(WebViewManager::class.java)?.getLatestWebView()
+            val webViewManager = project?.getService(WebViewManager::class.java)
+            val latestWebView = webViewManager?.getLatestWebView()
             if (latestWebView == null) {
                 return
             }
 
-            // Create message content based on command type
-            val messageContent = when {
-                // Add to context command
-                command.contains("addToContext") -> {
-                    val promptParams = if (params is Map<*, *>) params as Map<String, Any?> else emptyMap()
-                    mapOf(
-                        "type" to "invoke",
-                        "invoke" to "setChatBoxMessage",
-                        "text" to CostrictCodeSupportPrompt.create("ADD_TO_CONTEXT", promptParams)
-                    )
-                }
-                // Command executed in current task
-                command.endsWith("InCurrentTask") -> {
-                    val promptParams = if (params is Map<*, *>) params as Map<String, Any?> else emptyMap()
-                    val basePromptType = when {
-                        command.contains("explain") -> "EXPLAIN"
-                        command.contains("fix") -> "FIX"
-                        command.contains("improve") -> "IMPROVE"
-                        else -> promptType
-                    }
-                    mapOf(
-                        "type" to "invoke",
-                        "invoke" to "sendMessage",
-                        "text" to CostrictCodeSupportPrompt.create(basePromptType, promptParams)
-                    )
-                }
-                // Command executed in new task
-                else -> {
-                    val promptParams = if (params is List<*>) {
-                        // Process parameter list from createAction
-                        val argsList = params as List<Any>
-                        if (argsList.size >= 4) {
-                            mapOf(
-                                "filePath" to argsList[0],
-                                "selectedText" to argsList[1],
-                                "startLine" to argsList[2],
-                                "endLine" to argsList[3]
-                            )
-                        } else {
-                            emptyMap()
-                        }
-                    } else if (params is Map<*, *>) {
-                        params as Map<String, Any?>
+            // Resolve the normalized prompt params (filePath/selectedText/startLine/endLine)
+            // and the base prompt type regardless of how the action was invoked.
+            val promptParams: Map<String, Any?> = when (params) {
+                is Map<*, *> -> params as Map<String, Any?>
+                is List<*> -> {
+                    val argsList = params as List<Any>
+                    if (argsList.size >= 4) {
+                        mapOf(
+                            "filePath" to argsList[0],
+                            "selectedText" to argsList[1],
+                            "startLine" to argsList[2],
+                            "endLine" to argsList[3]
+                        )
                     } else {
                         emptyMap()
                     }
+                }
+                else -> emptyMap()
+            }
+            val basePromptType = when {
+                command.contains("addToContext") -> "ADD_TO_CONTEXT"
+                command.contains("explain") -> "EXPLAIN"
+                command.contains("fix") -> "FIX"
+                command.contains("improve") -> "IMPROVE"
+                else -> promptType
+            }
+            val promptText = CostrictCodeSupportPrompt.create(basePromptType, promptParams)
 
-                    val basePromptType = when {
-                        command.contains("explain") -> "EXPLAIN"
-                        command.contains("fix") -> "FIX"
-                        command.contains("improve") -> "IMPROVE"
-                        else -> promptType
-                    }
-
+            // Cloud UI is a separate frontend (iframe) that does not understand the
+            // classic "invoke" protocol. In cloud mode, deliver the prompt via the
+            // "assistantUIContext" message that the cloud webview consumes:
+            //   - addToContext: fill the input box without sending (focus only)
+            //   - explain/fix/improve: auto-send in a new thread
+            val isCloud = webViewManager.getUiMode() == "cloud"
+            val messageContent: Map<String, Any?> = if (isCloud) {
+                if (command.contains("addToContext")) {
                     mapOf(
+                        "type" to "assistantUIContext",
+                        "text" to promptText,
+                        "focus" to true
+                    )
+                } else {
+                    mapOf(
+                        "type" to "assistantUIContext",
+                        "text" to promptText,
+                        "focus" to true,
+                        "newThread" to true,
+                        "autoSend" to true
+                    )
+                }
+            } else {
+                // Classic mode: keep the original invoke-protocol behavior.
+                when {
+                    command.contains("addToContext") -> mapOf(
+                        "type" to "invoke",
+                        "invoke" to "setChatBoxMessage",
+                        "text" to promptText
+                    )
+                    command.endsWith("InCurrentTask") -> mapOf(
+                        "type" to "invoke",
+                        "invoke" to "sendMessage",
+                        "text" to promptText
+                    )
+                    else -> mapOf(
                         "type" to "invoke",
                         "invoke" to "initClineWithTask",
-                        "text" to CostrictCodeSupportPrompt.create(basePromptType, promptParams)
+                        "text" to promptText
                     )
                 }
             }

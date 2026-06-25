@@ -15,8 +15,12 @@ import com.sina.weibo.agent.ipc.proxy.logger.FileRPCProtocolLogger
 import com.sina.weibo.agent.ipc.proxy.uri.IURITransformer
 import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ProxyConfigUtil
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import java.io.File
 
 /**
  * Responsible for managing RPC protocols, service registration and implementation, plugin lifecycle management
@@ -47,6 +51,12 @@ class RPCManager(
      * Send configuration and workspace information to extension process
      */
     suspend fun startInitialize() {
+        // Debug: log immediately when startInitialize is called
+        try {
+            java.io.File("/tmp/cos-cli-debug.log").appendText(
+                "[INIT] startInitialize() CALLED\n"
+            )
+        } catch (_: Exception) {}
         try {
             logger.info("Starting to initialize plugin environment")
             withContext(Dispatchers.IO) {
@@ -73,13 +83,33 @@ class RPCManager(
                     logger.info("Using proxy configuration for initialization: $it")
                 }
 
-                // Create empty configuration model
+                // Create empty configuration model sections
                 val emptyMap = mapOf(
                     "contents" to emptyMap<String, Any>(),
                     "keys" to emptyList<String>(),
                     "overrides" to emptyList<String>()
                 )
-                
+
+                // Load persisted configuration from ~/.costrict-jetbrains/config.json
+                // so that settings like costrict.uiMode survive extension host restarts.
+                val persistedConfig = loadPersistedConfig()
+                val userLocalModel = if (persistedConfig.isNotEmpty()) {
+                    val nested = buildNestedContents(persistedConfig)
+                    // Debug: log what we are sending
+                    try {
+                        java.io.File("/tmp/cos-cli-debug.log").appendText(
+                            "[INIT] userLocal contents: ${com.google.gson.Gson().toJson(nested)}\n"
+                        )
+                    } catch (_: Exception) {}
+                    mapOf(
+                        "contents" to nested,
+                        "keys" to persistedConfig.keys.toList(),
+                        "overrides" to emptyList<String>()
+                    )
+                } else {
+                    emptyMap
+                }
+
                 val emptyConfigModel = mapOf(
                     "defaults" to mapOf(
                         "contents" to contentsBuilder,
@@ -88,15 +118,20 @@ class RPCManager(
                     ),
                     "policy" to emptyMap,
                     "application" to emptyMap,
-                    "userLocal" to emptyMap,
+                    "userLocal" to userLocalModel,
                     "userRemote" to emptyMap,
                     "workspace" to emptyMap,
                     "folders" to emptyList<Any>(),
                     "configurationScopes" to emptyList<Any>()
                 )
-
-                // Directly call the interface method
-                extHostConfiguration.initializeConfiguration(emptyConfigModel)
+                // Directly call the interface method and wait for the RPC response.
+                // Guard each await with a timeout: if the extension host hangs during
+                // initialization the plugin would otherwise stay in "loading" forever.
+                val initConfigResult = extHostConfiguration.initializeConfiguration(emptyConfigModel)
+                if (initConfigResult is CompletableDeferred<*>) {
+                    withTimeout(INIT_RPC_TIMEOUT_MS) { initConfigResult.await() }
+                    logger.info("Configuration initialization RPC completed")
+                }
 
                 // Get ExtHostWorkspace proxy
                 val extHostWorkspace = rpcProtocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWorkspace)
@@ -106,16 +141,34 @@ class RPCManager(
                 val workspaceData = project.getService(WorkspaceManager::class.java).getCurrentWorkspaceData()
 
                 // If workspace data is obtained, send it to extension process, otherwise send null
-                if (workspaceData != null) {
+                // Wait for the workspace initialization RPC response as well
+                val initWorkspaceResult = if (workspaceData != null) {
                     logger.info("Sending workspace data to extension process: ${workspaceData.name}, folders: ${workspaceData.folders.size}")
                     extHostWorkspace.initializeWorkspace(workspaceData, true)
                 } else {
                     logger.info("No available workspace data, sending null to extension process")
                     extHostWorkspace.initializeWorkspace(null, true)
                 }
+                if (initWorkspaceResult is CompletableDeferred<*>) {
+                    withTimeout(INIT_RPC_TIMEOUT_MS) { initWorkspaceResult.await() }
+                    logger.info("Workspace initialization RPC completed")
+                }
 
                 // Initialize workspace
                 logger.info("Workspace initialization completed")
+            }
+        } catch (e: TimeoutCancellationException) {
+            // Initialization RPC did not respond in time. Surface the failure to the
+            // tool window UI via lastInitializationFailure so the user sees an error
+            // state instead of an indefinite "Initializing..." screen. Do not auto-retry.
+            logger.error("Plugin initialization timed out after ${INIT_RPC_TIMEOUT_MS}ms waiting for extension host RPC", e)
+            try {
+                com.sina.weibo.agent.plugin.WecoderPlugin.getInstance(project).recordInitializationFailure(
+                    com.sina.weibo.agent.core.ExtensionProcessManager.StartFailureReason.PROCESS_START_EXCEPTION,
+                    "Initialization timed out waiting for extension host RPC (${INIT_RPC_TIMEOUT_MS}ms). The extension host may be unresponsive."
+                )
+            } catch (reportErr: Exception) {
+                logger.warn("Failed to record initialization timeout failure to UI", reportErr)
             }
         } catch (e: Exception) {
             logger.error("Failed to initialize plugin environment: ${e.message}", e)
@@ -146,7 +199,7 @@ class RPCManager(
         rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadDebugService, MainThreadDebugService())
 
         // MainThreadConfiguration
-        rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadConfiguration, MainThreadConfiguration())
+        rpcProtocol.set(ServiceProxyRegistry.MainContext.MainThreadConfiguration, MainThreadConfiguration(project))
 
         // MainThreadWorkspace
         val workspaceManager = project.getService(WorkspaceManager::class.java)
@@ -289,5 +342,58 @@ class RPCManager(
      */
     fun getRPCProtocol(): IRPCProtocol {
         return rpcProtocol
+    }
+
+    companion object {
+        private const val CONFIG_DIR_NAME = ".costrict-jetbrains"
+        private const val CONFIG_FILE_NAME = "config.json"
+
+        /**
+         * Per-RPC-call timeout for initialization awaits (config + workspace).
+         * 15s is generous for a local extension host; if exceeded we treat the
+         * extension host as hung and surface a failure instead of hanging forever.
+         */
+        private const val INIT_RPC_TIMEOUT_MS = 15_000L
+
+        /**
+         * Load persisted configuration from ~/.costrict-jetbrains/config.json.
+         * Used to restore settings like uiMode on extension host restart.
+         */
+        fun loadPersistedConfig(): Map<String, Any?> {
+            val configFile = File(System.getProperty("user.home"), "$CONFIG_DIR_NAME/$CONFIG_FILE_NAME")
+            if (!configFile.exists()) return emptyMap()
+            return try {
+                val json = configFile.readText()
+                @Suppress("UNCHECKED_CAST")
+                (com.google.gson.Gson().fromJson(json, Map::class.java) as? Map<String, Any?>) ?: emptyMap()
+            } catch (e: Exception) {
+                Logger.getInstance(RPCManager::class.java).warn("Failed to load config.json: ${e.message}")
+                emptyMap()
+            }
+        }
+
+        /**
+         * Convert a flat config map with dot-separated keys into a nested map structure.
+         * E.g. {"costrict.uiMode": "cloud"} -> {"costrict": {"uiMode": "cloud"}}.
+         * This matches the VSCode ConfigurationModel contents format.
+         */
+        fun buildNestedContents(flatConfig: Map<String, Any?>): Map<String, Any?> {
+            val result = mutableMapOf<String, Any?>()
+            for ((key, value) in flatConfig) {
+                val parts = key.split(".")
+                var current = result
+                for (i in parts.indices) {
+                    val part = parts[i]
+                    if (i == parts.lastIndex) {
+                        current[part] = value
+                    } else {
+                        @Suppress("UNCHECKED_CAST")
+                        val next = current.getOrPut(part) { mutableMapOf<String, Any?>() } as MutableMap<String, Any?>
+                        current = next
+                    }
+                }
+            }
+            return result
+        }
     }
 }

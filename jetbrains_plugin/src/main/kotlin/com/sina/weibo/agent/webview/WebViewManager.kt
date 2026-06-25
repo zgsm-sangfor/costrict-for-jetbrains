@@ -22,6 +22,7 @@ import com.sina.weibo.agent.events.WebviewViewProviderData
 import com.sina.weibo.agent.ipc.proxy.SerializableObjectWithBuffers
 import com.sina.weibo.agent.theme.ThemeChangeListener
 import com.sina.weibo.agent.theme.ThemeManager
+import com.sina.weibo.agent.util.ConfigFileUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -38,6 +39,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.pathString
@@ -51,6 +53,13 @@ interface WebViewCreationCallback {
      * @param instance Created WebView instance
      */
     fun onWebViewCreated(instance: WebViewInstance)
+
+    /**
+     * Called to remove a WebViewInstance's browser component from the UI panel.
+     * Implementations that manage a tool window panel should override this to
+     * remove the browser component. The default implementation is a no-op.
+     */
+    fun removeWebViewComponent(instance: WebViewInstance) {}
 }
 
 /**
@@ -60,9 +69,22 @@ interface WebViewCreationCallback {
 class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     private val logger = Logger.getInstance(WebViewManager::class.java)
 
+    private companion object {
+        /** Cloud UI (Assistant UI) sidebar viewType. */
+        const val CLOUD_VIEW_TYPE = "costrict.AssistantUISidebarProvider"
+    }
+
     // Latest created WebView instance
     @Volatile
     private var latestWebView: WebViewInstance? = null
+
+    // Handle-based routing: the VSCode protocol uses viewId (UUID) as the
+    // webview handle. When $setHtml arrives, we look up the correct WebView
+    // by that handle instead of always using latestWebView.
+    private val handleToWebview = ConcurrentHashMap<String, WebViewInstance>()
+
+    // viewType-based lookup for APIs like getWebViewByViewType and theme dispatch
+    private val viewTypeToWebview = ConcurrentHashMap<String, WebViewInstance>()
     
     // Store WebView creation callbacks
     private val creationCallbacks = mutableListOf<WebViewCreationCallback>()
@@ -80,6 +102,10 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     // Prevent repeated dispose
     private var isDisposed = false
     private var themeInitialized = false
+
+    // Current UI mode ("classic" or "cloud"), synced from setContext("costrict.uiMode", ...)
+    @Volatile
+    private var uiMode: String? = null
 
     /**
      * Initialize theme manager
@@ -134,11 +160,23 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
             throw IOException("Resource root directory does not exist")
         }
         
+        // Clean up stale index-*.html files from previous updates (keep only last 4)
+        try {
+            val rootDir = resourceRootDir!!
+            val oldFiles = java.nio.file.Files.list(rootDir)
+                .filter { p -> p.fileName.toString().startsWith("index-") && p.fileName.toString().endsWith(".html") }
+                .sorted(Comparator.comparingLong<Path> { java.nio.file.Files.getLastModifiedTime(it).toMillis() }.reversed())
+                .skip(4)
+                .toList()
+            oldFiles.forEach { oldFile -> java.nio.file.Files.deleteIfExists(oldFile) }
+        } catch (e: Exception) {
+            logger.warn("Failed to clean up old HTML files", e)
+        }
+        
         val filePath = resourceRootDir?.resolve(filename)
         
         try {
             if (filePath != null) {
-                logger.debug("HTML content saved to: $filePath")
                 Files.write(filePath, html.toByteArray(StandardCharsets.UTF_8))
                 return filePath
             }
@@ -295,63 +333,155 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     }
     
     /**
-     * Register WebView provider and create WebView instance
+     * Register WebView provider and create WebView instance.
+     *
+     * If a WebViewInstance for a *different* viewType already exists, the old one
+     * is removed from the panel and disposed before the new one is created.
+     * This prevents multiple JCEF browser components from stacking in the tool window
+     * when both classic and cloud providers are registered (e.g. in IDEA plugin).
      */
     fun registerProvider(data: WebviewViewProviderData) {
         logger.debug("Register WebView provider and create WebView instance: ${data.viewType}")
+
+        // ── Clean up stale WebViewInstances left behind by extension-host reloads ──
+        // When the VSCode extension host restarts (e.g. after switching UI mode) the
+        // old providers are killed without a proper unregister, leaving disposed
+        // WebViewInstances in our maps.  Re-using them causes HTML updates to be
+        // silently ignored because loadUrl/loadHtml check isDisposed.
+        val staleViewTypes = viewTypeToWebview.filter { it.value.isDisposed() }.keys.toList()
+        for (staleViewType in staleViewTypes) {
+            viewTypeToWebview.remove(staleViewType)
+        }
+        val staleHandles = handleToWebview.filter { it.value.isDisposed() }.keys.toList()
+        for (staleHandle in staleHandles) {
+            handleToWebview.remove(staleHandle)
+        }
+        if (latestWebView?.isDisposed() == true) {
+            latestWebView = null
+        }
+
+        // ── Dispose existing WebViewInstance of a different viewType ──
+        // Only dispose if the new viewType matches the current uiMode, so that a
+        // mis-matched provider registration (e.g. classic provider registering while
+        // the mode is "cloud") doesn't tear down the active WebView.
+        val existingDifferentViewType = viewTypeToWebview.entries.firstOrNull { it.key != data.viewType }
+        if (existingDifferentViewType != null) {
+            val oldViewType = existingDifferentViewType.key
+            val oldInstance = existingDifferentViewType.value
+
+            // If the new viewType matches the current mode, dispose the old one
+            // and show the new one.  Otherwise keep the old one visible.
+            val shouldSwitch = when (uiMode) {
+                "cloud" -> data.viewType == "costrict.AssistantUISidebarProvider"
+                "classic" -> data.viewType == "costrict.SidebarProvider"
+                else -> true // no mode set yet — switch unconditionally
+            }
+
+            if (shouldSwitch) {
+                logger.info("registerProvider: disposing old WebViewInstance for different viewType=$oldViewType (new=$data.viewType, uiMode=$uiMode)")
+
+                // Remove old browser component from the panel
+                removeBrowserComponentFromPanel(oldInstance)
+
+                // Remove from routing maps
+                viewTypeToWebview.remove(oldViewType)
+                handleToWebview.entries.removeAll { it.value == oldInstance }
+                if (latestWebView == oldInstance) {
+                    latestWebView = null
+                }
+
+                // Dispose JCEF browser resources
+                Disposer.dispose(oldInstance)
+            } else {
+                // The new viewType doesn't match current mode — register it in
+                // the background, but keep the active WebView visible and routable.
+                logger.info("registerProvider: registering viewType=${data.viewType} in background (uiMode=$uiMode, keeping $oldViewType visible)")
+            }
+        }
+
+        // ── If the same viewType already exists, re-resolve it ──
+        val existing = viewTypeToWebview[data.viewType]
+        if (existing != null) {
+            logger.debug("registerProvider: WebViewInstance already exists for viewType=${data.viewType}, re-resolving")
+            val proxy = project.getService(PluginContext::class.java).getRPCProtocol()
+                ?.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
+            if (proxy != null) {
+                proxy.resolveWebviewView(
+                    existing.viewId, data.viewType,
+                    data.options["title"] as? String ?: data.viewType,
+                    data.options["state"] as? Map<String, Any?> ?: emptyMap<String, Any?>(), null
+                )
+            }
+            latestWebView = existing
+            return
+        }
+
+        // ── Set resource root directory from extension ──
         val extension = data.extension
-        
-        // Get location info from extension and set resource root directory
         try {
             @Suppress("UNCHECKED_CAST")
             val location = extension?.get("location") as? Map<String, Any?>
             val fsPath = location?.get("fsPath") as? String
-            
             if (fsPath != null) {
-                // Set resource root directory
                 val path = Paths.get(fsPath)
                 logger.debug("Get resource directory path from extension: $path")
-                
-                // Ensure the resource directory exists
                 if (!path.exists()) {
                     path.createDirectories()
                 }
-                
-                 // Update resource root directory
                 resourceRootDir = path
-                
-                // Initialize theme manager
                 initializeThemeManager(fsPath)
-
             }
         } catch (e: Exception) {
             logger.error("Failed to get resource directory from extension", e)
         }
 
+        // ── Create new WebViewInstance ──
         val protocol = project.getService(PluginContext::class.java).getRPCProtocol()
         if (protocol == null) {
             logger.error("Cannot get RPC protocol instance, cannot register WebView provider: ${data.viewType}")
             return
         }
-        // When registration event is notified, create a new WebView instance
-        val viewId = UUID.randomUUID().toString()
 
+        val viewId = UUID.randomUUID().toString()
         val title = data.options["title"] as? String ?: data.viewType
         val state = data.options["state"] as? Map<String, Any?> ?: emptyMap()
-        
-        val webview = WebViewInstance(data.viewType, viewId, title, state,project,data.extension)
+        val webview = WebViewInstance(data.viewType, viewId, title, state, project, data.extension)
 
         val proxy = protocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
         proxy.resolveWebviewView(viewId, data.viewType, title, state, null)
 
-
-        // Set as the latest created WebView
         latestWebView = webview
-        
-        logger.debug("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
+        handleToWebview[viewId] = webview
+        viewTypeToWebview[data.viewType] = webview
 
-        // Notify callback
-        notifyWebViewCreated(webview)
+        // Only add the WebView to the tool window panel if it matches the
+        // current uiMode.  Mismatched providers are kept for routing but
+        // remain hidden until a mode switch brings them to the front.
+        val shouldShow = when (uiMode) {
+            "cloud" -> data.viewType == "costrict.AssistantUISidebarProvider"
+            "classic" -> data.viewType == "costrict.SidebarProvider"
+            else -> true // no mode set yet — show unconditionally
+        }
+
+        if (shouldShow) {
+            logger.debug("Create WebView instance (visible): viewType=${data.viewType}, viewId=$viewId, uiMode=$uiMode")
+            notifyWebViewCreated(webview)
+        } else {
+            logger.debug("Create WebView instance (hidden): viewType=${data.viewType}, viewId=$viewId, uiMode=$uiMode")
+        }
+    }
+
+    /**
+     * Find and remove a WebViewInstance's browser component from the tool window panel.
+     * Searches via the registered creation callbacks (which include RunVSAgentToolWindowContent).
+     */
+    private fun removeBrowserComponentFromPanel(instance: WebViewInstance) {
+        val callbacks = synchronized(creationCallbacks) { creationCallbacks.toList() }
+        ApplicationManager.getApplication().invokeLater {
+            for (callback in callbacks) {
+                callback.removeWebViewComponent(instance)
+            }
+        }
     }
     
     /**
@@ -362,22 +492,157 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     }
 
     /**
+         * Get a WebView by viewType, for handle-aware routing.
+         * Falls back to latestWebView when the map doesn't contain the key.
+         */
+    fun getWebViewByViewType(viewType: String): WebViewInstance? {
+        return viewTypeToWebview[viewType] ?: latestWebView
+    }
+
+    /**
+     * Look up a WebView by its full handle (the UUID minted at registerProvider,
+     * echoed back by the ext host in $setHtml / $postMessage). This is the precise
+     * routing key for response messages: unlike getWebViewByViewType it does NOT
+     * fall back to latestWebView, so it is safe in multi-project scenarios where
+     * latestWebView may belong to a different webview.
+     */
+    fun getWebViewByHandle(handle: String): WebViewInstance? {
+        return handleToWebview[handle]
+    }
+
+    /**
+     * Set the current UI mode and switch the visible WebView accordingly.
+     * Called from MainThreadCommands when setContext("costrict.uiMode", ...) is
+     * executed by the extension.
+     *
+     * @param mode "classic" to show costrict.SidebarProvider, "cloud" to show costrict.AssistantUISidebarProvider
+     */
+    fun setUiMode(mode: String?) {
+        uiMode = mode
+        logger.info("setUiMode: $mode")
+        switchToCurrentMode()
+    }
+
+    /**
+     * Get the current UI mode.
+     */
+    fun getUiMode(): String? = uiMode
+
+    /**
+     * Reload the cloud UI webview so it reconnects to the cs-cloud daemon.
+     *
+     * Called when the extension-host socket dies: all cloud UI API calls are
+     * proxied through the extension host, so a socket loss leaves the UI in a
+     * state where every request hangs forever and user retries do nothing.
+     * Reloading the page re-runs the bootstrap script (which re-installs the
+     * fetch override) and lets the UI talk to cs-cloud again, because cs-cloud
+     * runs as a detached daemon independent of the extension host socket.
+     *
+     * Safe to call from any thread; the actual JCEF load is scheduled on EDT.
+     */
+    fun reloadCloudWebView() {
+        val cloudWebView = getWebViewByViewType(CLOUD_VIEW_TYPE)
+        if (cloudWebView == null || cloudWebView.isDisposed()) {
+            logger.info("reloadCloudWebView: cloud webview not available (null or disposed), skipping reload")
+            return
+        }
+        logger.info("reloadCloudWebView: scheduling reload of cloud webview ${cloudWebView.viewType}/${cloudWebView.viewId}")
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                cloudWebView.reloadLastUrl()
+            } catch (e: Exception) {
+                logger.error("reloadCloudWebView: failed to reload cloud webview", e)
+            }
+        }
+    }
+
+    /**
+     * Switch the tool window to show the WebView that matches the current mode.
+     * ViewType mapping: classic → "costrict.SidebarProvider", cloud → "costrict.AssistantUISidebarProvider"
+     */
+    private fun switchToCurrentMode() {
+        val targetViewType = when (uiMode) {
+            "cloud" -> "costrict.AssistantUISidebarProvider"
+            "classic" -> "costrict.SidebarProvider"
+            else -> return
+        }
+        val targetWebView = viewTypeToWebview[targetViewType] ?: return
+
+        logger.info("switchToCurrentMode: switching to viewType=$targetViewType (uiMode=$uiMode)")
+
+        // Notify creation callbacks to show this WebView, which replaces the current one
+        val callbacks = synchronized(creationCallbacks) { creationCallbacks.toList() }
+        ApplicationManager.getApplication().invokeLater {
+            // Remove any previously visible WebView from the panel first
+            if (latestWebView != null) {
+                for (callback in callbacks) {
+                    callback.removeWebViewComponent(latestWebView!!)
+                }
+            }
+            // Show the target WebView
+            for (callback in callbacks) {
+                callback.onWebViewCreated(targetWebView)
+            }
+        }
+
+        // Remove any stale WebView whose viewType doesn't match the current mode
+        for ((existingViewType, instance) in viewTypeToWebview.entries) {
+            if (existingViewType != targetViewType) {
+                removeBrowserComponentFromPanel(instance)
+                handleToWebview.entries.removeAll { it.value == instance }
+                viewTypeToWebview.remove(existingViewType)
+                if (!instance.isDisposed()) {
+                    Disposer.dispose(instance)
+                }
+                logger.info("switchToCurrentMode: removed stale WebView viewType=$existingViewType")
+            }
+        }
+
+        latestWebView = targetWebView
+    }
+
+    /**
+         * Extract viewType from a TS-side webview handle.
+         * Handles follow the format "webview-<viewType>-<timestamp>".
+         */
+    private fun extractViewTypeFromHandle(handle: String): String? {
+        val withoutPrefix = handle.removePrefix("webview-")
+        val lastDash = withoutPrefix.lastIndexOf('-')
+        return if (lastDash >= 0) withoutPrefix.substring(0, lastDash) else withoutPrefix
+    }
+
+    /**
          * Update the HTML content of the WebView
          * @param data HTML update data
          */
     fun updateWebViewHtml(data: WebviewHtmlUpdateData) {
-        val encodedState = getLatestWebView()?.state.toString().replace("\"", "\\\"")
-        // Support both <script nonce="..."> and <script type="text/javascript" nonce="..."> formats
-        val mRst = """<script(?:\s+type="text/javascript")?\s+nonce="([A-Za-z0-9]{32})">""".toRegex().find(data.htmlContent)
-        val str = mRst?.value ?: ""
-        data.htmlContent = data.htmlContent.replace(str,"""
-                        ${str}
+        // Resolve the correct WebView for the incoming handle.
+        // Strategy (in order):
+        //  1. Direct handle lookup (handle == viewId generated by registerProvider)
+        //  2. viewType extraction from "webview-<viewType>-<timestamp>" handles
+        //  3. Fall back to latestWebView
+        val targetWebView = handleToWebview[data.handle]
+            ?: viewTypeToWebview[extractViewTypeFromHandle(data.handle) ?: ""]
+            ?: latestWebView
+
+        if (targetWebView == null) {
+            logger.warn("updateWebViewHtml: no WebView found for handle=${data.handle}")
+            return
+        }
+
+        logger.warn("updateWebViewHtml: routing handle=${data.handle} -> viewType=${targetWebView.viewType}")
+
+        val encodedState = targetWebView.state.toString().replace("\"", "\\\"")
+        val htmlLengthBefore = data.htmlContent.length
+
+        // The VSCode API mock block that must be injected into the page.
+        val vscodeApiMock = """
                         // First define the function to send messages
                         window.sendMessageToPlugin = function(message) {
                             // Convert JS object to JSON string
                             // console.log("sendMessageToPlugin: ", message);
                             const msgStr = JSON.stringify(message);
-                            ${getLatestWebView()?.jsQuery?.inject("msgStr")}
+                            ${targetWebView.jsQuery?.inject("msgStr")}
                         };
                         
                         // Inject VSCode API mock
@@ -420,29 +685,65 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
                             };
                         })();
                         
-                        // Clean up references to window parent for security
-                        delete window.parent;
-                        delete window.top;
-                        delete window.frameElement;
-                        
                         console.log("VSCode API mock injected");
-                        """)
+                        """
+
+        // --- Strategy 1: find the first <script … nonce="…" …> opening tag and ---
+        // --- prepend our mock right after it.                                   ---
+        // The regex is intentionally loose: after the nonce attribute there may be
+        // additional attributes (src, type, defer, etc.) before the closing ">".
+        val nonceScriptRegex = """<script\b[^>]*\bnonce="([A-Za-z0-9]{32,64})"[^>]*>""".toRegex()
+        val nonceMatch = nonceScriptRegex.find(data.htmlContent)
+
+        if (nonceMatch != null) {
+            val openingTag = nonceMatch.value
+            data.htmlContent = data.htmlContent.replaceFirst(openingTag, "$openingTag$vscodeApiMock")
+            logger.warn("updateWebViewHtml: injected mock via nonce script tag: '${openingTag.take(80)}...'")
+        } else {
+            // --- Strategy 2 (fallback): wrap mock in its own <script> block and ---
+            // --- inject right before </head> (or, failing that, before <body>). ---
+            val fallbackScript = "<script>$vscodeApiMock</script>"
+            val headCloseIdx = data.htmlContent.indexOf("</head>")
+            if (headCloseIdx >= 0) {
+                data.htmlContent = data.htmlContent.substring(0, headCloseIdx) +
+                        fallbackScript +
+                        data.htmlContent.substring(headCloseIdx)
+                logger.warn("updateWebViewHtml: injected mock via </head> fallback")
+            } else {
+                // Last resort: prepend
+                data.htmlContent = fallbackScript + data.htmlContent
+                logger.warn("updateWebViewHtml: injected mock via prepend fallback")
+            }
+            // Diagnostic: log the first few script tags for debugging.
+            // This is expected for loading HTML (no scripts) and error HTML
+            // (bare <script> without nonce).  The fallback injection above
+            // already handles these cases correctly.
+            val allScriptTags = """<script\b[^>]*>""".toRegex().findAll(data.htmlContent).take(5).map { it.value }.toList()
+            logger.warn("updateWebViewHtml: nonce regex DID NOT MATCH (expected for loading/error HTML). First 5 script tags: $allScriptTags, contains 'nonce=': ${data.htmlContent.contains("nonce=")}")
+        }
 
 
 
         // Inject environment variables into HTML content
         // Replace placeholders like "ANTHROPIC_MODEL": "undefined" with actual values
+        logger.warn("updateWebViewHtml: after mock injection htmlLength=${data.htmlContent.length} (delta=${data.htmlContent.length - htmlLengthBefore})")
+
         data.htmlContent = injectEnvironmentVariables(data.htmlContent)
-        logger.debug("Received HTML update event: handle=${data.handle}, html length: ${data.htmlContent.length}")
+        logger.warn("updateWebViewHtml: after env injection htmlLength=${data.htmlContent.length}, handle=${data.handle}")
         
-        val webView = getLatestWebView()
+        val webView = targetWebView
         
         if (webView != null) {
             try {
                 // If HTTP server is running
                 if ( resourceRootDir != null) {
-                    // Generate unique file name for WebView
-                    val filename = "index.html"
+                    // Use a unique filename per update (handle hash + timestamp) so that
+                    // JCEF treats every loadUrl as a brand-new resource.  When the loading
+                    // HTML is later replaced by the static HTML both calls used to write to
+                    // the same filename — JCEF cached the first URL and silently ignored the
+                    // second loadUrl with the identical address.
+                    val ts = System.currentTimeMillis()
+                    val filename = "index-${data.handle.hashCode().toString().replace("-", "n")}-$ts.html"
 
                     // Save HTML content to file
                     saveHtmlToResourceDir(data.htmlContent, filename)
@@ -520,6 +821,12 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         }
 
         try {
+            // Dispose all webviews in both maps, then clear them
+            handleToWebview.values.forEach { webview ->
+                try { webview.dispose() } catch (e: Exception) { logger.error("Failed to release WebView resources: ${webview.viewType}", e) }
+            }
+            handleToWebview.clear()
+            viewTypeToWebview.clear()
             latestWebView?.dispose()
         } catch (e: Exception) {
             logger.error("Failed to release WebView resources", e)
@@ -551,12 +858,17 @@ class WebViewInstance(
     val extension: Map<String, Any?>
 ) : Disposable {
     private val logger = Logger.getInstance(WebViewInstance::class.java)
-    
+
     // JCEF browser instance
-    val browser = JBCefBrowser.createBuilder().setOffScreenRendering(true).build()
+    val browser = JBCefBrowser.createBuilder()
+        .setOffScreenRendering(ConfigFileUtils.isWebViewOffscreenRenderingEnabled())
+        .build()
     
     // WebView state
     private var isDisposed = false
+
+    /** @return true if this WebViewInstance has already been disposed. */
+    fun isDisposed(): Boolean = isDisposed
 
     // JavaScript query handler for communication with webview
     var jsQuery: JBCefJSQuery? = null
@@ -569,10 +881,17 @@ class WebViewInstance(
 
     private var isPageLoaded = false
 
+    // Last URL successfully passed to loadUrl(). Used by reloadLastUrl() to
+    // re-load the current page (e.g. after the extension-host socket dies and
+    // the cloud UI must reconnect to the still-running cs-cloud daemon without
+    // going through the TS message bridge).
+    @Volatile
+    private var lastLoadedUrl: String? = null
+
     private var currentThemeConfig: JsonObject? = null
     
     // Callback for page load completion
-    private var pageLoadCallback: (() -> Unit)? = null
+    private var pageLoadCallback: ((success: Boolean, errorInfo: String?) -> Unit)? = null
     
     init {
         setupJSBridge()
@@ -604,7 +923,7 @@ class WebViewInstance(
      * Set callback for page load completion
      * @param callback Callback function to be called when page is loaded
      */
-    fun setPageLoadCallback(callback: (() -> Unit)?) {
+    fun setPageLoadCallback(callback: ((success: Boolean, errorInfo: String?) -> Unit)?) {
         pageLoadCallback = callback
     }
     
@@ -668,13 +987,45 @@ class WebViewInstance(
                                             defaultStylesElement.id = '_defaultStyles';
                                             document.head.appendChild(defaultStylesElement);
                                         }
-                                        
+
                                         // Add default_themes.css content
-                                        defaultStylesElement.textContent = `
+                                        // Cloud UI (AssistantUISidebarProvider) is a complete web app with its own
+                                        // layout system — skip body styles that would conflict with its layout.
+                                        const isCloudUi = ${this.viewType == "costrict.AssistantUISidebarProvider"};
+                                        defaultStylesElement.textContent = isCloudUi ? `
                                             html {
                                                 scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
                                             }
-                                            
+
+                                            ::-webkit-scrollbar {
+                                                width: 10px;
+                                                height: 10px;
+                                            }
+
+                                            ::-webkit-scrollbar-corner {
+                                                background-color: var(--vscode-editor-background);
+                                            }
+
+                                            ::-webkit-scrollbar-thumb {
+                                                background-color: var(--vscode-scrollbarSlider-background);
+                                            }
+                                            ::-webkit-scrollbar-thumb:hover {
+                                                background-color: var(--vscode-scrollbarSlider-hoverBackground);
+                                            }
+                                            ::-webkit-scrollbar-thumb:active {
+                                                background-color: var(--vscode-scrollbarSlider-activeBackground);
+                                            }
+                                            ::highlight(find-highlight) {
+                                                background-color: var(--vscode-editor-findMatchHighlightBackground);
+                                            }
+                                            ::highlight(current-find-highlight) {
+                                                background-color: var(--vscode-editor-findMatchBackground);
+                                            }
+                                        ` : `
+                                            html {
+                                                scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
+                                            }
+
                                             body {
                                                 overscroll-behavior-x: none;
                                                 background-color: transparent;
@@ -687,25 +1038,25 @@ class WebViewInstance(
                                                 overflow-x: hidden;   /* prevent horizontal scrollbar */
                                                 overflow-y: auto;     /* allow vertical scrolling only */
                                             }
-                                            
+
                                             img, video {
                                                 max-width: 100%;
                                                 height: auto;        /* keep aspect ratio and avoid vertical overflow */
                                                 display: block;      /* remove inline baseline gaps that can trigger overflow */
                                             }
-                                            
+
                                             a, a code {
                                                 color: var(--vscode-textLink-foreground);
                                             }
-                                            
+
                                             p > a {
                                                 text-decoration: var(--text-link-decoration);
                                             }
-                                            
+
                                             a:hover {
                                                 color: var(--vscode-textLink-activeForeground);
                                             }
-                                            
+
                                             a:focus,
                                             input:focus,
                                             select:focus,
@@ -713,7 +1064,7 @@ class WebViewInstance(
                                                 outline: 1px solid -webkit-focus-ring-color;
                                                 outline-offset: -1px;
                                             }
-                                            
+
                                             code {
                                                 font-family: var(--monaco-monospace-font);
                                                 color: var(--vscode-textPreformat-foreground);
@@ -721,16 +1072,16 @@ class WebViewInstance(
                                                 padding: 1px 3px;
                                                 border-radius: 4px;
                                             }
-                                            
+
                                             pre code {
                                                 padding: 0;
                                             }
-                                            
+
                                             blockquote {
                                                 background: var(--vscode-textBlockQuote-background);
                                                 border-color: var(--vscode-textBlockQuote-border);
                                             }
-                                            
+
                                             kbd {
                                                 background-color: var(--vscode-keybindingLabel-background);
                                                 color: var(--vscode-keybindingLabel-foreground);
@@ -743,19 +1094,19 @@ class WebViewInstance(
                                                 vertical-align: middle;
                                                 padding: 1px 3px;
                                             }
-                                            
+
                                             ::-webkit-scrollbar {
                                                 width: 10px;
                                                 height: 10px;
                                             }
-                                            
+
                                             ::-webkit-scrollbar-corner {
                                                 background-color: var(--vscode-editor-background);
                                             }
-                                            
+
                                             *, *::before, *::after { box-sizing: border-box; }
                                             html, body { width: 100%; height: 100%; }
-                                            
+
                                             ::-webkit-scrollbar-thumb {
                                                 background-color: var(--vscode-scrollbarSlider-background);
                                             }
@@ -797,9 +1148,11 @@ class WebViewInstance(
 
                 // Pass the theme config without cssContent via message
                 val themeConfigJson = gson.toJson(themeConfigCopy)
+                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
                 val message = """
                     {
                         "type": "theme",
+                        "theme": "$assistantUITheme",
                         "text": "${themeConfigJson.replace("\"", "\\\"")}"
                     }
                 """.trimIndent()
@@ -884,8 +1237,12 @@ class WebViewInstance(
                     source: String?,
                     line: Int
                 ): Boolean {
-                    logger.debug("WebView console message: [$level] $message (line: $line, source: $source)")
-                    return true
+                    val logMessage = "WebView console message: [$level] $message (line: $line, source: $source, viewType=$viewType, viewId=$viewId)"
+                    when (level?.name) {
+                        "LOGSEVERITY_ERROR", "LOGSEVERITY_WARNING" -> logger.warn(logMessage)
+                        else -> logger.info(logMessage)
+                    }
+                    return false
                 }
             }, browser.cefBrowser)
             
@@ -905,22 +1262,38 @@ class WebViewInstance(
                     frame: CefFrame?,
                     transitionType: CefRequest.TransitionType?
                 ) {
-                    logger.debug("WebView started loading: ${frame?.url}, transition type: $transitionType")
-                    isPageLoaded = false
+                    logger.info("WebView started loading: url=${frame?.url}, transitionType=$transitionType, viewType=$viewType, viewId=$viewId")
+                    if (frame?.isMain == true) {
+                        isPageLoaded = false
+                    }
                 }
-                
+
                 override fun onLoadEnd(
                     browser: CefBrowser?,
                     frame: CefFrame?,
                     httpStatusCode: Int
                 ) {
-                    logger.debug("WebView finished loading: ${frame?.url}, status code: $httpStatusCode")
-                    isPageLoaded = true
-                    injectTheme()
-                    // Notify page load completion
-                    pageLoadCallback?.invoke()
+                    val url = frame?.url
+                    val isMainFrame = frame?.isMain == true
+                    logger.info("WebView finished loading: url=$url, statusCode=$httpStatusCode, isMainFrame=$isMainFrame, viewType=$viewType, viewId=$viewId")
+
+                    if (!isMainFrame) {
+                        return
+                    }
+
+                    val success = httpStatusCode in 200..399 || httpStatusCode == 0
+                    if (success) {
+                        isPageLoaded = true
+                        injectTheme()
+                        pageLoadCallback?.invoke(true, null)
+                    } else {
+                        isPageLoaded = false
+                        val errorInfo = "HTTP $httpStatusCode while loading $url"
+                        logger.warn("WebView main frame load completed with error: $errorInfo, viewType=$viewType, viewId=$viewId")
+                        pageLoadCallback?.invoke(false, errorInfo)
+                    }
                 }
-                
+
                 override fun onLoadError(
                     browser: CefBrowser?,
                     frame: CefFrame?,
@@ -928,7 +1301,14 @@ class WebViewInstance(
                     errorText: String?,
                     failedUrl: String?
                 ) {
-                    logger.debug("WebView load error: $failedUrl, error code: $errorCode, error message: $errorText")
+                    val frameUrl = frame?.url
+                    val isMainFrame = frame?.isMain == true
+                    val errorInfo = "CEF load error $errorCode: $errorText, failedUrl=$failedUrl, frameUrl=$frameUrl"
+                    logger.warn("WebView load error: $errorInfo, isMainFrame=$isMainFrame, viewType=$viewType, viewId=$viewId")
+                    if (isMainFrame) {
+                        isPageLoaded = false
+                        pageLoadCallback?.invoke(false, errorInfo)
+                    }
                 }
             }, browser.cefBrowser)
             client.addRequestHandler(object : CefRequestHandlerAdapter() {
@@ -979,6 +1359,27 @@ class WebViewInstance(
     fun loadUrl(url: String) {
         if (!isDisposed) {
             logger.debug("WebView loading URL: $url")
+            lastLoadedUrl = url
+            browser.loadURL(url)
+        }
+    }
+
+    /**
+     * Reload the last URL passed to loadUrl(), if any. Used to recover the
+     * cloud UI after the extension-host socket dies: re-running the page
+     * bootstrap re-executes the fetch override so the UI reconnects to the
+     * cs-cloud daemon (which runs as an independent process and survives the
+     * socket loss). No-op if nothing was loaded yet or the instance is disposed.
+     */
+    fun reloadLastUrl() {
+        val url = lastLoadedUrl
+        if (url == null) {
+            logger.info("reloadLastUrl: no previous URL to reload for $viewType/$viewId")
+            return
+        }
+        if (!isDisposed) {
+            logger.info("reloadLastUrl: reloading $viewType/$viewId from $url")
+            isPageLoaded = false
             browser.loadURL(url)
         }
     }

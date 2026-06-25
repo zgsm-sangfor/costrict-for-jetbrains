@@ -10,8 +10,10 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.sina.weibo.agent.core.PluginContext
+import com.sina.weibo.agent.ipc.proxy.interfaces.ExtHostConfigurationProxy
 import com.sina.weibo.agent.util.URI
 import com.sina.weibo.agent.util.URIComponents
+import java.io.File
 
 /**
  * Enum for configuration targets.
@@ -121,8 +123,89 @@ interface MainThreadConfigurationShape : Disposable {
  * Provides concrete implementation for managing IDE configuration settings
  * across different scopes and contexts.
  */
-class MainThreadConfiguration : MainThreadConfigurationShape {
+class MainThreadConfiguration(private val project: Project? = null) : MainThreadConfigurationShape {
     private val logger = Logger.getInstance(MainThreadConfiguration::class.java)
+
+    /** In-memory config mirror of ~/.costrict-jetbrains/config.json. */
+    private val persistedConfig = loadPersistedConfig()
+
+    companion object {
+        private const val CONFIG_DIR_NAME = ".costrict-jetbrains"
+        private const val CONFIG_FILE_NAME = "config.json"
+    }
+
+    private fun getConfigDir(): File =
+        File(System.getProperty("user.home"), CONFIG_DIR_NAME)
+
+    private fun getConfigFilePath(): File =
+        File(getConfigDir(), CONFIG_FILE_NAME)
+
+    private fun loadPersistedConfig(): MutableMap<String, Any?> {
+        val file = getConfigFilePath()
+        if (!file.exists()) return mutableMapOf()
+        return try {
+            val json = file.readText()
+            @Suppress("UNCHECKED_CAST")
+            (com.google.gson.Gson().fromJson(json, Map::class.java) as? Map<String, Any?>)
+                ?.toMutableMap() ?: mutableMapOf()
+        } catch (e: Exception) {
+            logger.warn("Failed to load config.json: ${e.message}")
+            mutableMapOf()
+        }
+    }
+
+    private fun savePersistedConfig() {
+        val dir = getConfigDir()
+        if (!dir.exists()) dir.mkdirs()
+        try {
+            getConfigFilePath().writeText(
+                com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(persistedConfig)
+            )
+            // Also write to a file-based debug log
+            try {
+                java.io.File("/tmp/cos-cli-debug.log").appendText(
+                    "[CONFIG] savePersistedConfig done, uiMode=${persistedConfig["costrict.uiMode"]}\n"
+                )
+            } catch (_: Exception) {}
+        } catch (e: Exception) {
+            logger.error("Failed to save config.json: ${e.message}", e)
+            try {
+                java.io.File("/tmp/cos-cli-debug.log").appendText(
+                    "[CONFIG] savePersistedConfig FAILED: ${e.message}\n"
+                )
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun syncToExtensionHost(changedKeys: List<String>) {
+        val ctx = project?.let { PluginContext.getInstance(it) }
+        val rpc = ctx?.getRPCProtocol() ?: return
+        try {
+            val extHostConfig = rpc.getProxy<ExtHostConfigurationProxy>(
+                // proxy identifier must match what is registered on the ext host side
+                com.sina.weibo.agent.core.ServiceProxyRegistry.ExtHostContext.ExtHostConfiguration
+            )
+            val userLocalModel = mapOf(
+                "contents" to com.sina.weibo.agent.core.RPCManager.buildNestedContents(persistedConfig),
+                "keys" to changedKeys,
+                "overrides" to emptyList<Any>()
+            )
+            val data = mapOf(
+                "defaults" to mapOf("contents" to emptyMap<String, Any>(), "keys" to emptyList<Any>(), "overrides" to emptyList<Any>()),
+                "policy" to mapOf("contents" to emptyMap<String, Any>(), "keys" to emptyList<Any>(), "overrides" to emptyList<Any>()),
+                "application" to mapOf("contents" to emptyMap<String, Any>(), "keys" to emptyList<Any>(), "overrides" to emptyList<Any>()),
+                "userLocal" to userLocalModel,
+                "userRemote" to mapOf("contents" to emptyMap<String, Any>(), "keys" to emptyList<Any>(), "overrides" to emptyList<Any>()),
+                "workspace" to mapOf("contents" to emptyMap<String, Any>(), "keys" to emptyList<Any>(), "overrides" to emptyList<Any>()),
+                "folders" to emptyList<Any>(),
+                "configurationScopes" to emptyList<Any>()
+            )
+            extHostConfig.acceptConfigurationChanged(data, mapOf("keys" to changedKeys, "overrides" to emptyList<Any>()))
+            logger.info("Synced configuration change to extension host: $changedKeys")
+        } catch (e: Exception) {
+            logger.warn("Failed to sync configuration to extension host: ${e.message}")
+        }
+    }
     
     /**
      * Updates a configuration option in the specified target scope.
@@ -141,9 +224,15 @@ class MainThreadConfiguration : MainThreadConfigurationShape {
         val configOverrides = convertToConfigurationOverrides(overrides)
         
         // Log the configuration update for debugging purposes
-        logger.debug("Update configuration option: target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value, " +
+        logger.info("Update configuration option: target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value, " +
                    "overrideIdentifier=${configOverrides?.overrideIdentifier}, resource=${configOverrides?.resource}, " +
                    "scopeToLanguage=$scopeToLanguage")
+        // Also write to a file-based debug log for tracing the RPC flow
+        try {
+            java.io.File("/tmp/cos-cli-debug.log").appendText(
+                "[CONFIG] updateConfigurationOption called target=${configTarget?.let { ConfigurationTarget.toString(it) }}, key=$key, value=$value\n"
+            )
+        } catch (_: Exception) {}
         
         // Build the complete configuration key including overrides and language scoping
         val fullKey = buildConfigurationKey(key, configOverrides, scopeToLanguage)
@@ -178,6 +267,24 @@ class MainThreadConfiguration : MainThreadConfigurationShape {
                 storeValue(properties, memoryPrefixedKey, value)
             }
         }
+        // Also persist to ~/.costrict-jetbrains/config.json so that the
+        // extension host can reload it on next restart. This mirrors what
+        // rpcManager.ts does in its local $updateConfigurationOption handler.
+        if (value == null || (overrides.isNullOrEmpty() && scopeToLanguage != true)) {
+            persistedConfig[key] = value
+        } else {
+            persistedConfig[fullKey] = value
+        }
+        savePersistedConfig()
+        // NOTE: syncToExtensionHost is intentionally omitted here. The
+        // $updateConfigurationOption RPC originates FROM the ExtHost, so it
+        // already has the updated value in its in-memory model. Calling
+        // acceptConfigurationChanged back would (a) create a re-entrant RPC
+        // during request handling which can deadlock / time-out, and (b) send
+        // a configuration model with EMPTY defaults that overwrites the
+        // initialization model (losing e.g. workbench.colorTheme). The
+        // persisted config.json is the source-of-truth across restarts –
+        // RPCManager.startInitialize() will reload it on the next launch.
     }
     
     /**
@@ -233,6 +340,17 @@ class MainThreadConfiguration : MainThreadConfigurationShape {
                 properties.unsetValue(memoryPrefixedKey)
             }
         }
+
+        // Also remove from persisted config.
+        if (overrides.isNullOrEmpty() && scopeToLanguage != true) {
+            persistedConfig.remove(key)
+        } else {
+            persistedConfig.remove(fullKey)
+        }
+        savePersistedConfig()
+        // NOTE: syncToExtensionHost is intentionally omitted – same reasoning
+        // as updateConfigurationOption above. The ExtHost already knows about
+        // the removal because it initiated the $removeConfigurationOption RPC.
     }
     
     /**
