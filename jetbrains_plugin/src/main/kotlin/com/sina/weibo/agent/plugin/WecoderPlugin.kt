@@ -459,6 +459,16 @@ class WecoderPluginService(private var currentProject: Project) : Disposable {
         lastInitializationFailure = null
     }
 
+    /**
+     * Record an initialization failure from outside the normal initialize() flow
+     * (e.g. RPC initialization timeout detected by RPCManager). The recorded
+     * failure is surfaced to the tool window UI via getLastInitializationFailure().
+     */
+    fun recordInitializationFailure(reason: ExtensionProcessManager.StartFailureReason, message: String) {
+        lastInitializationFailure = ExtensionProcessManager.StartFailure(reason, message)
+        LOG.warn("Initialization failure recorded: reason=$reason, message=$message")
+    }
+
     private fun initPlatformFiles() {
         // Initialize platform related files
         val platformSuffix = when {

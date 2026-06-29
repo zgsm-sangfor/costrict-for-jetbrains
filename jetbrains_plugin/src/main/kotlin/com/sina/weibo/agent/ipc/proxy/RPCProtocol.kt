@@ -681,6 +681,15 @@ class RPCProtocol(
      * Execute handler invocation
      */
     private suspend fun doInvokeHandler(rpcId: Int, methodName: String, args: List<Any?>): Any? {
+        // Trace configuration-related RPC calls (methodName already has $ stripped by MessageIO)
+        if (methodName == "updateConfigurationOption" || methodName == "removeConfigurationOption" ||
+            methodName == "initializeConfiguration") {
+            try {
+                java.io.File("/tmp/cos-cli-debug.log").appendText(
+                    "[RPC] doInvokeHandler received method=$methodName, rpcId=$rpcId, argsCount=${args.size}\n"
+                )
+            } catch (_: Exception) {}
+        }
         val actor = locals[rpcId]
         if(actor == null) {
             val actorName = getStringIdentifierForProxy(rpcId)

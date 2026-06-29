@@ -30,6 +30,8 @@ class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) 
     private val logger = Logger.getInstance(LocalCefResHandle::class.java)
 
     private var file: File? = null
+    private var requestedFilePath: String? = null
+    private var requestPath: String? = null
     private var fileContent: ByteArray? = null
     private var offset = 0
 
@@ -39,6 +41,7 @@ class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) 
         logger.info("Request URL: ${request?.url}")
         
         val requestPath = request?.url?.decodeURLPart()?.replace("http://localhost:","")?.substringAfter("/")?.substringBefore("?")
+        this.requestPath = requestPath
         logger.info("Extracted request path: $requestPath")
         
         requestPath?.let {
@@ -47,6 +50,7 @@ class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) 
             } else {
                 "$resourceBasePath/$requestPath"
             }
+            requestedFilePath = filePath
             logger.info("Constructed file path: $filePath")
             
             file = File(filePath)
@@ -57,12 +61,12 @@ class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) 
                     fileContent = file!!.readBytes()
                     logger.info("File content loaded successfully, size: ${fileContent?.size} bytes")
                 } catch (e: Exception) {
-                    logger.warn("Cannot get file content, error: ${e}")
+                    logger.error("Cannot read local WebView resource: url=${request?.url}, basePath=$resourceBasePath, filePath=$filePath", e)
                     file = null
                     fileContent = null
                 }
             } else {
-                logger.warn("File does not exist or is not a file: exists=${file?.exists()}, isFile=${file?.isFile}")
+                logger.warn("Local WebView resource not found: url=${request?.url}, basePath=$resourceBasePath, filePath=$filePath, exists=${file?.exists()}, isFile=${file?.isFile}")
                 file = null
                 fileContent = null
             }
@@ -101,8 +105,9 @@ class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) 
 
     override fun getResponseHeaders(resp: CefResponse?, p1: IntRef?, p2: StringRef?) {
         if (fileContent == null) {
+            logger.warn("Returning 404 for local WebView resource: url=${request?.url}, basePath=$resourceBasePath, filePath=$requestedFilePath")
             resp?.status = 404
-            resp?.statusText = "Not Found"
+            resp?.statusText = "Not Found: ${requestedFilePath ?: request?.url ?: "unknown"}"
             return
         }
 

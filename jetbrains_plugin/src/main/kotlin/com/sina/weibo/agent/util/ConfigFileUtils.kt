@@ -19,6 +19,13 @@ object ConfigFileUtils {
         val currentExtensionId = properties.getProperty(PluginConstants.ConfigFiles.EXTENSION_TYPE_KEY)
         return currentExtensionId
     }
+
+    fun isWebViewOffscreenRenderingEnabled(): Boolean {
+        // Default to false: offscreen rendering is observed to cause first-paint
+        // grey-screen / slow init on Linux+JCEF. Users can opt back in by setting
+        // webview.offscreen.rendering=true in the config file.
+        return getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_OFFSCREEN_RENDERING_KEY, "false")?.toBoolean() ?: false
+    }
     
     /**
      * Ensure configuration directory exists
