@@ -137,15 +137,15 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
      * Send theme config to all WebView instances
      */
     private fun sendThemeConfigToWebViews(themeConfig: JsonObject) {
-        logger.debug("Send theme config to WebView")
-        
-//        getAllWebViews().forEach { webView ->
+        logger.debug("Send theme config to WebViews")
+
+        for (webView in viewTypeToWebview.values) {
             try {
-                getLatestWebView()?.sendThemeConfigToWebView(themeConfig)
+                webView.sendThemeConfigToWebView(themeConfig)
             } catch (e: Exception) {
                 logger.error("Failed to send theme config to WebView", e)
             }
-//        }
+        }
     }
     
     /**
@@ -222,6 +222,63 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         }
         
         return modifiedHtml
+    }
+    
+    /**
+     * Seed classic WebViews with the current VS Code theme before JCEF's first paint.
+     *
+     * Runtime theme injection happens after the main frame loads. Until then the bundled
+     * classic HTML leaves html/body/#root transparent, so Chromium shows its default white
+     * viewport even though controls using VS Code variables can already render dark.
+     */
+    private fun injectInitialClassicThemeStyles(html: String, webView: WebViewInstance): String {
+        if (webView.viewType == CLOUD_VIEW_TYPE) {
+            return html
+        }
+
+        val cssContent = currentThemeConfig
+            ?.takeIf { it.has("cssContent") }
+            ?.get("cssContent")
+            ?.asString
+            ?: return html
+
+        val cssVariables = cssContent.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("--") }
+            .joinToString("\n") { "    $it" }
+
+        if (cssVariables.isBlank()) {
+            return html
+        }
+
+        val initialThemeStyle = """
+            <style id="_initialWebviewTheme">
+            :root {
+            $cssVariables
+            }
+
+            html,
+            body {
+                width: 100%;
+                min-height: 100%;
+                margin: 0;
+                background-color: var(--vscode-editor-background);
+                color: var(--vscode-editor-foreground);
+            }
+
+            #root {
+                min-height: 100%;
+                background-color: var(--vscode-editor-background);
+            }
+            </style>
+        """.trimIndent()
+
+        val headCloseIndex = html.indexOf("</head>", ignoreCase = true)
+        return if (headCloseIndex >= 0) {
+            html.substring(0, headCloseIndex) + initialThemeStyle + "\n" + html.substring(headCloseIndex)
+        } else {
+            initialThemeStyle + "\n" + html
+        }
     }
     
     /**
@@ -729,6 +786,7 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         logger.warn("updateWebViewHtml: after mock injection htmlLength=${data.htmlContent.length} (delta=${data.htmlContent.length - htmlLengthBefore})")
 
         data.htmlContent = injectEnvironmentVariables(data.htmlContent)
+        data.htmlContent = injectInitialClassicThemeStyles(data.htmlContent, targetWebView)
         logger.warn("updateWebViewHtml: after env injection htmlLength=${data.htmlContent.length}, handle=${data.handle}")
         
         val webView = targetWebView
@@ -942,13 +1000,26 @@ class WebViewInstance(
                 // Remove cssContent property from the copy
                 themeConfigCopy.remove("cssContent")
 
+                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
+                val isCloudUi = viewType == "costrict.AssistantUISidebarProvider"
                 // Inject CSS variables into WebView
                 if (cssContent != null) {
                     val injectThemeScript = """
                         (function() {
+                            const assistantUITheme = "$assistantUITheme";
+                            const isCloudUi = $isCloudUi;
                             console.log("Ready to inject CSS variables into WebView")
                             function injectCSSVariables() {
                                 if(document.documentElement) {
+                                    if (isCloudUi) {
+                                        document.documentElement.classList.toggle('dark', assistantUITheme === 'dark');
+                                    }
+                                    if (document.body && !isCloudUi) {
+                                        const themeKind = assistantUITheme === 'light' ? 'vscode-light' : 'vscode-dark';
+                                        document.body.classList.toggle('vscode-light', themeKind === 'vscode-light');
+                                        document.body.classList.toggle('vscode-dark', themeKind === 'vscode-dark');
+                                        document.body.dataset.vscodeThemeKind = themeKind;
+                                    }
                                     // Convert cssContent to style attribute of html tag
                                     try {
                                         // Extract CSS variables (format: --name:value;)
@@ -988,10 +1059,10 @@ class WebViewInstance(
                                             document.head.appendChild(defaultStylesElement);
                                         }
 
-                                        // Add default_themes.css content
+                                        // Add default_themes.css content.
                                         // Cloud UI (AssistantUISidebarProvider) is a complete web app with its own
-                                        // layout system — skip body styles that would conflict with its layout.
-                                        const isCloudUi = ${this.viewType == "costrict.AssistantUISidebarProvider"};
+                                        // light/dark theme classes. Apply that class above and only inject shared
+                                        // VS Code variables/scrollbar styles plus the theme message.
                                         defaultStylesElement.textContent = isCloudUi ? `
                                             html {
                                                 scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
@@ -1028,7 +1099,7 @@ class WebViewInstance(
 
                                             body {
                                                 overscroll-behavior-x: none;
-                                                background-color: transparent;
+                                                background-color: var(--vscode-editor-background);
                                                 color: var(--vscode-editor-foreground);
                                                 font-family: var(--vscode-font-family);
                                                 font-weight: var(--vscode-font-weight);
@@ -1105,7 +1176,8 @@ class WebViewInstance(
                                             }
 
                                             *, *::before, *::after { box-sizing: border-box; }
-                                            html, body { width: 100%; height: 100%; }
+                                            html, body { width: 100%; height: 100%; background-color: var(--vscode-editor-background); }
+                                            #root { min-height: 100%; background-color: var(--vscode-editor-background); }
 
                                             ::-webkit-scrollbar-thumb {
                                                 background-color: var(--vscode-scrollbarSlider-background);
@@ -1148,7 +1220,6 @@ class WebViewInstance(
 
                 // Pass the theme config without cssContent via message
                 val themeConfigJson = gson.toJson(themeConfigCopy)
-                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
                 val message = """
                     {
                         "type": "theme",
