@@ -17,7 +17,6 @@ import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.openapi.application.ApplicationInfo
-import com.intellij.ide.BrowserUtil
 import com.sina.weibo.agent.actions.OpenDevToolsAction
 import com.sina.weibo.agent.core.ExtensionProcessManager
 import com.sina.weibo.agent.plugin.WecoderPlugin
@@ -47,6 +46,7 @@ import javax.swing.BorderFactory
 import com.intellij.util.ui.JBFont
 import com.intellij.util.ui.JBUI
 import com.sina.weibo.agent.util.ConfigFileUtils
+import com.sina.weibo.agent.util.NotificationUtil
 
 class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
 
@@ -610,7 +610,7 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             isFocusPainted = false
             border = javax.swing.BorderFactory.createEmptyBorder(8, 16, 8, 16)
             addActionListener {
-                BrowserUtil.browse("https://github.com/wecode-ai/RunVSAgent/blob/main/docs/KNOWN_ISSUES.md")
+                NotificationUtil.safeBrowse("https://github.com/wecode-ai/RunVSAgent/blob/main/docs/KNOWN_ISSUES.md")
             }
         }
 

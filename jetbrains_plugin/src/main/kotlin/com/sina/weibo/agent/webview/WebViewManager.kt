@@ -6,7 +6,6 @@ package com.sina.weibo.agent.webview
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
@@ -23,9 +22,11 @@ import com.sina.weibo.agent.ipc.proxy.SerializableObjectWithBuffers
 import com.sina.weibo.agent.theme.ThemeChangeListener
 import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ConfigFileUtils
+import com.sina.weibo.agent.util.NotificationUtil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.cef.CefSettings
 import org.cef.browser.CefBrowser
@@ -72,6 +73,16 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     private companion object {
         /** Cloud UI (Assistant UI) sidebar viewType. */
         const val CLOUD_VIEW_TYPE = "costrict.AssistantUISidebarProvider"
+
+        /**
+         * Debounce window used by [updateWebViewHtml] to coalesce rapid
+         * consecutive `$setHtml` calls for the same handle while the webview
+         * has not yet finished loading. Picked empirically: the cs-cloud
+         * sidebar's loading → static HTML pair arrives within ~10–20 ms, so
+         * 80 ms is comfortably above that while still feeling instantaneous
+         * to the user on first paint.
+         */
+        const val HTML_UPDATE_DEBOUNCE_MS = 80L
     }
 
     // Latest created WebView instance
@@ -85,6 +96,25 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
 
     // viewType-based lookup for APIs like getWebViewByViewType and theme dispatch
     private val viewTypeToWebview = ConcurrentHashMap<String, WebViewInstance>()
+
+    /**
+     * Per-handle monotonically increasing sequence number used to coalesce rapid
+     * `$setHtml` calls (see [updateWebViewHtml]). When the extension host emits a
+     * loading page immediately followed by the real content (e.g. the cs-cloud
+     * sidebar's `loadContent` flow: `getAssistantUILoadingHtml` then the static
+     * HTML after `ensureStarted()` resolves), both calls reach us within a few
+     * milliseconds. Without coalescing, two `loadUrl`s race inside JCEF and the
+     * stale loading HTML frequently wins, leaving the webview stuck on the
+     * loading screen with no bootstrap script. The latest-wins debounce below
+     * drops the intermediate loading HTML and only loads the final payload.
+     */
+    private val htmlUpdateSeq = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Coroutine scope used by [updateWebViewHtml]'s debounce path. Uses
+     * [Dispatchers.IO] so the [delay] never blocks the EDT / JCEF UI thread.
+     */
+    private val debounceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     
     // Store WebView creation callbacks
     private val creationCallbacks = mutableListOf<WebViewCreationCallback>()
@@ -800,6 +830,65 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
 
         logger.warn("updateWebViewHtml: routing handle=${data.handle} -> viewType=${targetWebView.viewType}")
 
+        // Coalesce rapid $setHtml calls for the same handle while the page has
+        // not yet finished loading. The cs-cloud sidebar sets a short loading
+        // page and then (a few ms later) the real static HTML once the cs-cloud
+        // daemon is ready; loading both in quick succession races inside JCEF
+        // and the stale loading HTML can win, leaving the UI stuck. Once the
+        // page has loaded at least once we skip the debounce so that legitimate
+        // follow-up updates (e.g. theme changes) are applied immediately.
+        if (!targetWebView.isPageLoaded()) {
+            val seq = htmlUpdateSeq.merge(data.handle, 1L, Long::plus) ?: 1L
+            logger.info("updateWebViewHtml: debouncing handle=${data.handle} seq=$seq htmlLength=${data.htmlContent.length}")
+            debounceScope.launch {
+                delay(HTML_UPDATE_DEBOUNCE_MS)
+                // Drop this scheduled load if the webview was torn down during
+                // the debounce window (e.g. window closed / plugin unload).
+                if (targetWebView.isDisposed()) {
+                    logger.info("updateWebViewHtml: target disposed during debounce, dropping handle=${data.handle} seq=$seq")
+                    return@launch
+                }
+                // Only proceed if no newer update for this handle has arrived
+                // since we scheduled ourselves; otherwise a newer coroutine owns
+                // the final loadUrl and we must drop this (stale) payload.
+                val current = htmlUpdateSeq[data.handle]
+                if (current != null && current != seq) {
+                    logger.info("updateWebViewHtml: superseded handle=${data.handle} seq=$seq (current=$current), dropping")
+                    return@launch
+                }
+                // JCEF's loadURL must be invoked on the EDT. The non-debounced
+                // path runs synchronously on the caller's thread (already EDT
+                // in practice); here we explicitly hop back so behaviour stays
+                // identical.
+                ApplicationManager.getApplication().invokeLater {
+                    if (targetWebView.isDisposed()) {
+                        return@invokeLater
+                    }
+                    performUpdateWebViewHtml(data, targetWebView)
+                }
+            }
+            return
+        }
+
+        performUpdateWebViewHtml(data, targetWebView)
+    }
+
+    /**
+     * Undebounced implementation that actually rewrites the HTML (nonce mock,
+     * env injection, theme styles) and triggers the JCEF loadUrl/loadHtml.
+     * Called either directly (page already loaded) or after the debounce window
+     * in [updateWebViewHtml].
+     */
+    private fun performUpdateWebViewHtml(data: WebviewHtmlUpdateData, targetWebView: WebViewInstance) {
+        if (targetWebView.isDisposed()) {
+            logger.warn("updateWebViewHtml: target already disposed, skipping handle=${data.handle}")
+            return
+        }
+        // Clear the debounce bookkeeping once we are about to commit a load so
+        // that the next first-load cycle (e.g. after a dispose/recreate) starts
+        // fresh.
+        htmlUpdateSeq.remove(data.handle)
+
         val encodedState = targetWebView.state.toString().replace("\"", "\\\"")
         val htmlLengthBefore = data.htmlContent.length
 
@@ -1409,6 +1498,78 @@ class WebViewInstance(
         }
     }
 
+    companion object {
+        /**
+         * URL schemes that should be delegated to the OS default browser when the
+         * embedded webview tries to navigate to them. Everything else (e.g.
+         * `file`, `vscode-file`, `vscode`, `vscode-resource`, `command`, `data`,
+         * `about`, `chrome`) is considered editor-internal and must NOT be sent
+         * to the browser. See [isExternalBrowserUrl].
+         */
+        private val EXTERNAL_BROWSER_SCHEMES = setOf("http", "https", "mailto", "ftp")
+
+        /**
+         * Loopback host literals. The embedded webview talks to several local
+         * services over http:
+         *   - `http://localhost:12345/...` serves the webview's own HTML/assets,
+         *   - `http://127.0.0.1:<port>/...` is the CoStrict backend API (port
+         *     assigned dynamically) consumed by the Cloud UI SPA.
+         * Navigations/fetches to any of these must NEVER be redirected to the OS
+         * default browser — doing so breaks the SPA's bootstrap (it never
+         * receives API responses and stays on the loading screen).
+         */
+        private val LOOPBACK_HOSTS = setOf("localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1")
+    }
+
+    /**
+     * @return `true` only when [url] is an external link that should be opened in
+     *         the OS default browser. Returns `false` for:
+     *         - any loopback origin (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`)
+     *           — the webview's own assets and the CoStrict backend API live there,
+     *         - editor-internal schemes (`file:`, `vscode-file:`, `command:`, ...)
+     *           — handled by the frontend's `openFile` postMessage path or ignored,
+     *         - malformed URLs (no scheme / unparseable).
+     */
+    private fun isExternalBrowserUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val schemeEnd = url.indexOf(':')
+        if (schemeEnd <= 0) return false
+        val scheme = url.substring(0, schemeEnd).lowercase(Locale.ROOT)
+        if (scheme !in EXTERNAL_BROWSER_SCHEMES) return false
+        // http/https/ftp carry an authority — check the host. mailto has none.
+        val host = try {
+            java.net.URI(url).host?.lowercase(Locale.ROOT)
+        } catch (_: Throwable) {
+            null
+        }
+        // If we cannot determine the host, do NOT delegate to the browser —
+        // safer to drop the navigation than to risk breaking a local service.
+        if (host == null) return false
+        return host !in LOOPBACK_HOSTS
+    }
+
+    /**
+     * @return `true` if [url] is an `http(s)` URL whose host is a loopback
+     *         literal (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`). These
+     *         origins serve the webview's own assets (e.g.
+     *         `http://localhost:12345`) and the CoStrict backend API (e.g.
+     *         `http://127.0.0.1:<port>`) consumed by the Cloud UI SPA, and
+     *         must be allowed to proceed inside the embedded webview.
+     */
+    private fun isLoopbackHttpUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val schemeEnd = url.indexOf(':')
+        if (schemeEnd <= 0) return false
+        val scheme = url.substring(0, schemeEnd).lowercase(Locale.ROOT)
+        if (scheme != "http" && scheme != "https") return false
+        val host = try {
+            java.net.URI(url).host?.lowercase(Locale.ROOT)
+        } catch (_: Throwable) {
+            null
+        } ?: return false
+        return host in LOOPBACK_HOSTS
+    }
+
     /**
          * Enable resource request interception
          */
@@ -1512,12 +1673,36 @@ class WebViewInstance(
                     user_gesture: Boolean,
                     is_redirect: Boolean
                 ): Boolean {
-                    logger.debug("onBeforeBrowse,url:${request?.url}")
-                    if(request?.url?.startsWith("http://localhost") == false){
-                        BrowserUtil.browse(request.url)
-                        return true
+                    val url = request?.url
+                    logger.debug("onBeforeBrowse,url:$url")
+                    // Three navigation classes:
+                    //   1. Loopback http(s) (localhost / 127.0.0.1 / ::1 / 0.0.0.0):
+                    //      the webview's own assets (http://localhost:12345) AND the
+                    //      CoStrict backend API (http://127.0.0.1:<dynamic port>)
+                    //      consumed by the Cloud UI SPA. MUST let through unchanged.
+                    //   2. Genuine external links (non-loopback http/https/mailto/ftp):
+                    //      hand to the OS default browser via safeBrowse.
+                    //   3. Editor-internal schemes (file://, vscode-file://, vscode://,
+                    //      command:, data:, about:, chrome:, ...): local-file clicks
+                    //      are handled by the frontend's `openFile` postMessage path,
+                    //      which opens them in the editor via FileEditorManager.
+                    //      Previously these were *also* sent to BrowserUtil.browse,
+                    //      causing the OS browser to open the path in addition to the
+                    //      editor — now we just cancel the in-webview navigation.
+                    return when {
+                        // Class 1: let the webview proceed (return false = do not cancel).
+                        isLoopbackHttpUrl(url) -> false
+                        // Class 2: external link -> OS browser. BrowserUtil.browse can
+                        // throw on intranet/headless machines (e.g. "Desktop API is not
+                        // supported"); this callback runs on the JCEF UI thread, so an
+                        // uncaught throwable freezes/crashes the webview -> safeBrowse.
+                        isExternalBrowserUrl(url) -> {
+                            NotificationUtil.safeBrowse(url)
+                            true
+                        }
+                        // Class 3: editor-internal / malformed -> swallow.
+                        else -> true
                     }
-                    return false
                 }
 
                 override fun getResourceRequestHandler(
