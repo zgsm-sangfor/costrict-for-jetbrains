@@ -668,6 +668,117 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         return if (lastDash >= 0) withoutPrefix.substring(0, lastDash) else withoutPrefix
     }
 
+    /** Random alphanumeric token, matching the length/format the extension uses for its nonces. */
+    private fun generateNonce(): String {
+        val possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        val random = java.security.SecureRandom()
+        val sb = StringBuilder(32)
+        repeat(32) { sb.append(possible[random.nextInt(possible.length)]) }
+        return sb.toString()
+    }
+
+    /**
+     * Patch the CSP of [html] so that an inline `<script nonce="[nonce]">` is allowed to run.
+     *
+     * Some webview HTML (notably the cs-cloud loading/error page) ships a strict CSP of
+     * `default-src 'none'; style-src 'unsafe-inline'` with no `script-src` directive, which
+     * falls back to `default-src 'none'` and blocks ALL scripts — including the VSCode API
+     * mock this plugin injects. Without this rewrite the loading page stays stuck forever.
+     *
+     * Per the CSP spec, an explicit `script-src` takes precedence over `default-src` for
+     * scripts, so we only need to add `script-src 'nonce-[nonce]'` — we never have to touch
+     * `default-src` (preserving the page's other restrictions).
+     *
+     * Behavior:
+     *  - If a CSP `<meta>` already exists:
+     *      • if `script-src` is present and already lists `'nonce-[nonce]'` → unchanged
+     *      • if `script-src` is present but lacks the nonce → append `'nonce-[nonce]'`
+     *      • if `script-src` is absent → prepend `script-src 'nonce-[nonce]'`
+     *  - If no CSP `<meta>` exists → inject `<meta http-equiv="Content-Security-Policy"
+     *    content="script-src 'nonce-[nonce]'">` right after `<head>`.
+     *
+     * The original CSP source expressions are preserved so existing legitimate scripts
+     * (bundled app scripts, etc.) keep working.
+     */
+    private fun allowNonceInCsp(html: String, nonce: String): String {
+        val nonceDirective = "'nonce-$nonce'"
+        // Match: <meta http-equiv="Content-Security-Policy" content="...">
+        // Tolerate single/double quotes and attribute order. The captured content value may
+        // contain HTML-entity-escaped quotes (e.g. &#39;) but never a raw " or ', so the
+        // ["'][^"']*]["'] char-class still captures the whole value correctly.
+        val cspMetaRegex = Regex(
+            """<meta\b[^>]*\bhttp-equiv\s*=\s*["']?\s*Content-Security-Policy["']?\s+[^>]*?\bcontent\s*=\s*["']([^"']*)["']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val match = cspMetaRegex.find(html) ?: run {
+            // No CSP meta at all — inject a minimal one that allows our nonce'd script.
+            val injectedCsp = htmlEncodeForDoubleQuotedAttr("script-src $nonceDirective")
+            val injected = "<meta http-equiv=\"Content-Security-Policy\" " +
+                "content=\"$injectedCsp\" />"
+            val headOpenMatch = Regex("<head\\b[^>]*>", RegexOption.IGNORE_CASE).find(html)
+            if (headOpenMatch == null) {
+                return html + injected // no <head> either; append at end as a last resort
+            }
+            val insertAt = headOpenMatch.range.last + 1
+            return html.substring(0, insertAt) + injected + html.substring(insertAt)
+        }
+
+        val cspBodyRaw = match.groupValues[1]
+        // The captured value is HTML-attribute text and may contain entity-escaped
+        // characters — most importantly &#39; for the ' quotes CSP keywords use, and
+        // &#39; itself contains a literal ';' which would corrupt the directive split
+        // below if we left it encoded. Decode entities, work on real CSP text, then
+        // re-encode when writing back.
+        val cspBody = htmlDecode(cspBodyRaw)
+        val directives = cspBody.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+
+        val scriptSrcIdx = directives.indexOfFirst { it.startsWith("script-src", ignoreCase = true) }
+        if (scriptSrcIdx >= 0) {
+            val existing = directives[scriptSrcIdx]
+            if (existing.contains(nonceDirective, ignoreCase = true)) {
+                return html // already allows this nonce
+            }
+            directives[scriptSrcIdx] = "$existing $nonceDirective"
+        } else {
+            // No script-src directive → add one. Per CSP spec script-src overrides
+            // default-src for scripts, so default-src 'none' no longer blocks our script.
+            directives.add(0, "script-src $nonceDirective")
+        }
+
+        val newCspBody = htmlEncodeForDoubleQuotedAttr(directives.joinToString("; "))
+        // Replace only the captured content="..." value inside the matched <meta>. We splice
+        // by the captured value's range (group 1) rather than using a regex replacement
+        // string, so any characters in newCspBody are taken literally.
+        val contentValueRange = match.groups[1]!!.range
+        val sb = StringBuilder(html.length + 16)
+        sb.append(html, 0, contentValueRange.first)
+        sb.append(newCspBody)
+        sb.append(html, contentValueRange.last + 1, html.length)
+        return sb.toString()
+    }
+
+    /** Decode the subset of HTML entities the CSP attribute may legally contain. */
+    private fun htmlDecode(s: String): String =
+        s.replace("&#39;", "'")
+            .replace("&#x27;", "'")
+            .replace("&apos;", "'")
+            .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
+            .replace("&#x22;", "\"")
+            .replace("&amp;", "&")
+
+    /**
+     * Re-encode [s] for safe inclusion inside a double-quoted HTML attribute value, i.e.
+     * escape `"` and `&` (and `'` for readability/compat). Matches the form the cs-cloud
+     * extension itself emits (`&#39;`).
+     */
+    private fun htmlEncodeForDoubleQuotedAttr(s: String): String =
+        s.replace("&", "&amp;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
     /**
          * Update the HTML content of the WebView
          * @param data HTML update data
@@ -757,9 +868,23 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
             data.htmlContent = data.htmlContent.replaceFirst(openingTag, "$openingTag$vscodeApiMock")
             logger.warn("updateWebViewHtml: injected mock via nonce script tag: '${openingTag.take(80)}...'")
         } else {
-            // --- Strategy 2 (fallback): wrap mock in its own <script> block and ---
-            // --- inject right before </head> (or, failing that, before <body>). ---
-            val fallbackScript = "<script>$vscodeApiMock</script>"
+            // --- Strategy 2 (fallback): no <script nonce="…"> tag in the HTML.   ---
+            // --- This happens for the cs-cloud loading/error HTML, whose CSP is  ---
+            // --- `default-src 'none'; style-src 'unsafe-inline'` with no          ---
+            // --- script-src directive — every inline script is blocked by CSP,   ---
+            // --- so a bare <script>…</script> would be silently refused and the   ---
+            // --- webview would stay stuck on the loading screen.                  ---
+            // --- Fix: generate a fresh nonce, rewrite the CSP <meta> to allow     ---
+            // --- scripts carrying that nonce, then inject the mock with it.       ---
+            val fallbackNonce = generateNonce()
+
+            // Rewrite the CSP meta so the injected script is permitted.
+            val cspBefore = data.htmlContent
+            data.htmlContent = allowNonceInCsp(data.htmlContent, fallbackNonce)
+            val cspRewritten = data.htmlContent != cspBefore
+            logger.warn("updateWebViewHtml: fallback nonce=$fallbackNonce, cspRewritten=$cspRewritten")
+
+            val fallbackScript = "<script nonce=\"$fallbackNonce\">$vscodeApiMock</script>"
             val headCloseIdx = data.htmlContent.indexOf("</head>")
             if (headCloseIdx >= 0) {
                 data.htmlContent = data.htmlContent.substring(0, headCloseIdx) +
@@ -772,9 +897,6 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
                 logger.warn("updateWebViewHtml: injected mock via prepend fallback")
             }
             // Diagnostic: log the first few script tags for debugging.
-            // This is expected for loading HTML (no scripts) and error HTML
-            // (bare <script> without nonce).  The fallback injection above
-            // already handles these cases correctly.
             val allScriptTags = """<script\b[^>]*>""".toRegex().findAll(data.htmlContent).take(5).map { it.value }.toList()
             logger.warn("updateWebViewHtml: nonce regex DID NOT MATCH (expected for loading/error HTML). First 5 script tags: $allScriptTags, contains 'nonce=': ${data.htmlContent.contains("nonce=")}")
         }
