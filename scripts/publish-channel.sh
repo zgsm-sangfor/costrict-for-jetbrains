@@ -46,7 +46,11 @@ REPO_SLUG="${COSTRICT_REPO:-zgsm-sangfor/costrict-for-jetbrains}"
 ASSET_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${ASSET}"
 PLUGIN_ID="${COSTRICT_PLUGIN_ID:-CoStrict}"
 SINCE_BUILD="${COSTRICT_SINCE_BUILD:-233}"
-UNTIL_BUILD="${COSTRICT_UNTIL_BUILD:-252.*}"
+# Leave UNTIL_BUILD empty to match the plugin's own plugin.xml (patchPluginXml
+# sets untilBuild=""). A fixed upper bound here would filter out newer IDEAs
+# (e.g. 2026.x, build 262+) from ever seeing the update. Override via
+# COSTRICT_UNTIL_BUILD if you ever need to cap compatibility.
+UNTIL_BUILD="${COSTRICT_UNTIL_BUILD:-}"
 BRANCH=gh-pages
 
 # Bail out if there are uncommitted changes (we're about to switch branches).
@@ -75,6 +79,13 @@ fi
 
 echo ">> writing updatePlugins.xml (id=${PLUGIN_ID}, version=${VERSION})"
 mkdir -p downloads
+# Build the idea-version tag; omit until-build when empty (no upper bound),
+# matching the plugin's own plugin.xml which leaves untilBuild unset.
+IDEA_VERSION_TAG="<idea-version since-build=\"${SINCE_BUILD}\""
+if [[ -n "$UNTIL_BUILD" ]]; then
+  IDEA_VERSION_TAG+=" until-build=\"${UNTIL_BUILD}\""
+fi
+IDEA_VERSION_TAG+="/>"
 cat > updatePlugins.xml <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <plugins>
@@ -83,7 +94,7 @@ cat > updatePlugins.xml <<EOF
       version="${VERSION}"
       url="${ASSET_URL}">
     <name>CoStrict</name>
-    <idea-version since-build="${SINCE_BUILD}" until-build="${UNTIL_BUILD}"/>
+    ${IDEA_VERSION_TAG}
     <description>CoStrict AI Coding Assistant</description>
   </plugin>
 </plugins>
