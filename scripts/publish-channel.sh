@@ -33,6 +33,14 @@
 # Requirements:
 #   - gh CLI authenticated, OR push access to the repo.
 #   - Run from a clean working tree (the script switches branches).
+#
+# Environment variables:
+#   COSTRICT_DOWNLOAD_BASE  Download host for the zip.
+#                           Default: https://zgsm.sangfor.com/costrict-static/jetbrains-plugin
+#                           (fast, China-friendly, supports HTTP Range)
+#                           Override to e.g. https://github.com/<repo>/releases/download
+#                           if you ever want to serve from GitHub Releases.
+#   COSTRICT_REPO           GitHub <org>/<repo> for Pages hosting.
 # =============================================================================
 set -euo pipefail
 
@@ -43,8 +51,14 @@ VERSION="${TAG#v}"
 [[ -z "$ASSET" ]] && ASSET="CoStrict-${VERSION}.zip"
 
 REPO_SLUG="${COSTRICT_REPO:-zgsm-sangfor/costrict-for-jetbrains}"
-ASSET_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${ASSET}"
 PLUGIN_ID="${COSTRICT_PLUGIN_ID:-CoStrict}"
+# Download host for the plugin zip. Default to the internal static server
+# (fast, China-friendly, supports HTTP Range so IntelliJ's chunked
+# PluginDownloader works). Override with COSTRICT_DOWNLOAD_BASE to use another
+# host, e.g.:
+#   GitHub:  https://github.com/${REPO_SLUG}/releases/download
+DOWNLOAD_BASE="${COSTRICT_DOWNLOAD_BASE:-https://zgsm.sangfor.com/costrict-static/jetbrains-plugin}"
+ASSET_URL="${DOWNLOAD_BASE%/}/${ASSET}"
 SINCE_BUILD="${COSTRICT_SINCE_BUILD:-233}"
 # Leave UNTIL_BUILD empty to match the plugin's own plugin.xml (patchPluginXml
 # sets untilBuild=""). A fixed upper bound here would filter out newer IDEAs
