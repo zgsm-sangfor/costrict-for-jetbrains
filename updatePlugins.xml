@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugins>
+  <plugin
+      id="CoStrict"
+      version="3.0.17"
+      url="https://github.com/zgsm-sangfor/costrict-for-jetbrains/releases/download/v3.0.17/CoStrict-3.0.17.zip">
+    <name>CoStrict</name>
+    <idea-version since-build="233" until-build="252.*"/>
+    <description>CoStrict AI Coding Assistant</description>
+  </plugin>
+</plugins>
