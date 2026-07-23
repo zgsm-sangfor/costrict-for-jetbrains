@@ -13,11 +13,11 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.content.ContentFactory
+import com.intellij.ui.JBColor
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.openapi.application.ApplicationInfo
-import com.intellij.ide.BrowserUtil
 import com.sina.weibo.agent.actions.OpenDevToolsAction
 import com.sina.weibo.agent.core.ExtensionProcessManager
 import com.sina.weibo.agent.plugin.WecoderPlugin
@@ -47,6 +47,7 @@ import javax.swing.BorderFactory
 import com.intellij.util.ui.JBFont
 import com.intellij.util.ui.JBUI
 import com.sina.weibo.agent.util.ConfigFileUtils
+import com.sina.weibo.agent.util.NotificationUtil
 
 class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
 
@@ -95,7 +96,16 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
         private val extensionManager = ExtensionManager.getInstance(project)
 
         // Content panel
-        private val contentPanel = JPanel(BorderLayout())
+        //
+        // Background is pinned to JBColor.background() so it matches the colour
+        // JCEF uses to clear its embedded webview buffer (JBCefBrowser#getBackgroundColor).
+        // During tool-window / IDE resize the Swing container is repainted before the
+        // heavyweight JCEF component catches up; if the container's default background
+        // differs from the webview's, the freshly-exposed area flashes white/gray.
+        // Matching the clear colour eliminates that flicker.
+        private val contentPanel = JPanel(BorderLayout()).apply {
+            background = JBColor.background()
+        }
 
         // Placeholder label
         private val placeholderLabel = JLabel(createSystemInfoText())
@@ -610,7 +620,7 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             isFocusPainted = false
             border = javax.swing.BorderFactory.createEmptyBorder(8, 16, 8, 16)
             addActionListener {
-                BrowserUtil.browse("https://github.com/wecode-ai/RunVSAgent/blob/main/docs/KNOWN_ISSUES.md")
+                NotificationUtil.safeBrowse("https://github.com/wecode-ai/RunVSAgent/blob/main/docs/KNOWN_ISSUES.md")
             }
         }
 
@@ -636,6 +646,10 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
 
         // Main panel
         val content: JPanel = JPanel(BorderLayout()).apply {
+            // Match the JCEF webview clear colour to avoid a contrasting flash
+            // during resize (see contentPanel comment).
+            background = JBColor.background()
+
             // Set content panel with both label and button
             contentPanel.layout = BorderLayout()
 

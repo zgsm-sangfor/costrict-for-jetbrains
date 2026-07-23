@@ -6,7 +6,6 @@ package com.sina.weibo.agent.webview
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
@@ -23,9 +22,11 @@ import com.sina.weibo.agent.ipc.proxy.SerializableObjectWithBuffers
 import com.sina.weibo.agent.theme.ThemeChangeListener
 import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ConfigFileUtils
+import com.sina.weibo.agent.util.NotificationUtil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.cef.CefSettings
 import org.cef.browser.CefBrowser
@@ -72,6 +73,16 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
     private companion object {
         /** Cloud UI (Assistant UI) sidebar viewType. */
         const val CLOUD_VIEW_TYPE = "costrict.AssistantUISidebarProvider"
+
+        /**
+         * Debounce window used by [updateWebViewHtml] to coalesce rapid
+         * consecutive `$setHtml` calls for the same handle while the webview
+         * has not yet finished loading. Picked empirically: the cs-cloud
+         * sidebar's loading → static HTML pair arrives within ~10–20 ms, so
+         * 80 ms is comfortably above that while still feeling instantaneous
+         * to the user on first paint.
+         */
+        const val HTML_UPDATE_DEBOUNCE_MS = 80L
     }
 
     // Latest created WebView instance
@@ -85,6 +96,25 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
 
     // viewType-based lookup for APIs like getWebViewByViewType and theme dispatch
     private val viewTypeToWebview = ConcurrentHashMap<String, WebViewInstance>()
+
+    /**
+     * Per-handle monotonically increasing sequence number used to coalesce rapid
+     * `$setHtml` calls (see [updateWebViewHtml]). When the extension host emits a
+     * loading page immediately followed by the real content (e.g. the cs-cloud
+     * sidebar's `loadContent` flow: `getAssistantUILoadingHtml` then the static
+     * HTML after `ensureStarted()` resolves), both calls reach us within a few
+     * milliseconds. Without coalescing, two `loadUrl`s race inside JCEF and the
+     * stale loading HTML frequently wins, leaving the webview stuck on the
+     * loading screen with no bootstrap script. The latest-wins debounce below
+     * drops the intermediate loading HTML and only loads the final payload.
+     */
+    private val htmlUpdateSeq = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Coroutine scope used by [updateWebViewHtml]'s debounce path. Uses
+     * [Dispatchers.IO] so the [delay] never blocks the EDT / JCEF UI thread.
+     */
+    private val debounceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     
     // Store WebView creation callbacks
     private val creationCallbacks = mutableListOf<WebViewCreationCallback>()
@@ -137,15 +167,15 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
      * Send theme config to all WebView instances
      */
     private fun sendThemeConfigToWebViews(themeConfig: JsonObject) {
-        logger.debug("Send theme config to WebView")
-        
-//        getAllWebViews().forEach { webView ->
+        logger.debug("Send theme config to WebViews")
+
+        for (webView in viewTypeToWebview.values) {
             try {
-                getLatestWebView()?.sendThemeConfigToWebView(themeConfig)
+                webView.sendThemeConfigToWebView(themeConfig)
             } catch (e: Exception) {
                 logger.error("Failed to send theme config to WebView", e)
             }
-//        }
+        }
     }
     
     /**
@@ -222,6 +252,63 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         }
         
         return modifiedHtml
+    }
+    
+    /**
+     * Seed classic WebViews with the current VS Code theme before JCEF's first paint.
+     *
+     * Runtime theme injection happens after the main frame loads. Until then the bundled
+     * classic HTML leaves html/body/#root transparent, so Chromium shows its default white
+     * viewport even though controls using VS Code variables can already render dark.
+     */
+    private fun injectInitialClassicThemeStyles(html: String, webView: WebViewInstance): String {
+        if (webView.viewType == CLOUD_VIEW_TYPE) {
+            return html
+        }
+
+        val cssContent = currentThemeConfig
+            ?.takeIf { it.has("cssContent") }
+            ?.get("cssContent")
+            ?.asString
+            ?: return html
+
+        val cssVariables = cssContent.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("--") }
+            .joinToString("\n") { "    $it" }
+
+        if (cssVariables.isBlank()) {
+            return html
+        }
+
+        val initialThemeStyle = """
+            <style id="_initialWebviewTheme">
+            :root {
+            $cssVariables
+            }
+
+            html,
+            body {
+                width: 100%;
+                min-height: 100%;
+                margin: 0;
+                background-color: var(--vscode-editor-background);
+                color: var(--vscode-editor-foreground);
+            }
+
+            #root {
+                min-height: 100%;
+                background-color: var(--vscode-editor-background);
+            }
+            </style>
+        """.trimIndent()
+
+        val headCloseIndex = html.indexOf("</head>", ignoreCase = true)
+        return if (headCloseIndex >= 0) {
+            html.substring(0, headCloseIndex) + initialThemeStyle + "\n" + html.substring(headCloseIndex)
+        } else {
+            initialThemeStyle + "\n" + html
+        }
     }
     
     /**
@@ -611,6 +698,117 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         return if (lastDash >= 0) withoutPrefix.substring(0, lastDash) else withoutPrefix
     }
 
+    /** Random alphanumeric token, matching the length/format the extension uses for its nonces. */
+    private fun generateNonce(): String {
+        val possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        val random = java.security.SecureRandom()
+        val sb = StringBuilder(32)
+        repeat(32) { sb.append(possible[random.nextInt(possible.length)]) }
+        return sb.toString()
+    }
+
+    /**
+     * Patch the CSP of [html] so that an inline `<script nonce="[nonce]">` is allowed to run.
+     *
+     * Some webview HTML (notably the cs-cloud loading/error page) ships a strict CSP of
+     * `default-src 'none'; style-src 'unsafe-inline'` with no `script-src` directive, which
+     * falls back to `default-src 'none'` and blocks ALL scripts — including the VSCode API
+     * mock this plugin injects. Without this rewrite the loading page stays stuck forever.
+     *
+     * Per the CSP spec, an explicit `script-src` takes precedence over `default-src` for
+     * scripts, so we only need to add `script-src 'nonce-[nonce]'` — we never have to touch
+     * `default-src` (preserving the page's other restrictions).
+     *
+     * Behavior:
+     *  - If a CSP `<meta>` already exists:
+     *      • if `script-src` is present and already lists `'nonce-[nonce]'` → unchanged
+     *      • if `script-src` is present but lacks the nonce → append `'nonce-[nonce]'`
+     *      • if `script-src` is absent → prepend `script-src 'nonce-[nonce]'`
+     *  - If no CSP `<meta>` exists → inject `<meta http-equiv="Content-Security-Policy"
+     *    content="script-src 'nonce-[nonce]'">` right after `<head>`.
+     *
+     * The original CSP source expressions are preserved so existing legitimate scripts
+     * (bundled app scripts, etc.) keep working.
+     */
+    private fun allowNonceInCsp(html: String, nonce: String): String {
+        val nonceDirective = "'nonce-$nonce'"
+        // Match: <meta http-equiv="Content-Security-Policy" content="...">
+        // Tolerate single/double quotes and attribute order. The captured content value may
+        // contain HTML-entity-escaped quotes (e.g. &#39;) but never a raw " or ', so the
+        // ["'][^"']*]["'] char-class still captures the whole value correctly.
+        val cspMetaRegex = Regex(
+            """<meta\b[^>]*\bhttp-equiv\s*=\s*["']?\s*Content-Security-Policy["']?\s+[^>]*?\bcontent\s*=\s*["']([^"']*)["']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val match = cspMetaRegex.find(html) ?: run {
+            // No CSP meta at all — inject a minimal one that allows our nonce'd script.
+            val injectedCsp = htmlEncodeForDoubleQuotedAttr("script-src $nonceDirective")
+            val injected = "<meta http-equiv=\"Content-Security-Policy\" " +
+                "content=\"$injectedCsp\" />"
+            val headOpenMatch = Regex("<head\\b[^>]*>", RegexOption.IGNORE_CASE).find(html)
+            if (headOpenMatch == null) {
+                return html + injected // no <head> either; append at end as a last resort
+            }
+            val insertAt = headOpenMatch.range.last + 1
+            return html.substring(0, insertAt) + injected + html.substring(insertAt)
+        }
+
+        val cspBodyRaw = match.groupValues[1]
+        // The captured value is HTML-attribute text and may contain entity-escaped
+        // characters — most importantly &#39; for the ' quotes CSP keywords use, and
+        // &#39; itself contains a literal ';' which would corrupt the directive split
+        // below if we left it encoded. Decode entities, work on real CSP text, then
+        // re-encode when writing back.
+        val cspBody = htmlDecode(cspBodyRaw)
+        val directives = cspBody.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+
+        val scriptSrcIdx = directives.indexOfFirst { it.startsWith("script-src", ignoreCase = true) }
+        if (scriptSrcIdx >= 0) {
+            val existing = directives[scriptSrcIdx]
+            if (existing.contains(nonceDirective, ignoreCase = true)) {
+                return html // already allows this nonce
+            }
+            directives[scriptSrcIdx] = "$existing $nonceDirective"
+        } else {
+            // No script-src directive → add one. Per CSP spec script-src overrides
+            // default-src for scripts, so default-src 'none' no longer blocks our script.
+            directives.add(0, "script-src $nonceDirective")
+        }
+
+        val newCspBody = htmlEncodeForDoubleQuotedAttr(directives.joinToString("; "))
+        // Replace only the captured content="..." value inside the matched <meta>. We splice
+        // by the captured value's range (group 1) rather than using a regex replacement
+        // string, so any characters in newCspBody are taken literally.
+        val contentValueRange = match.groups[1]!!.range
+        val sb = StringBuilder(html.length + 16)
+        sb.append(html, 0, contentValueRange.first)
+        sb.append(newCspBody)
+        sb.append(html, contentValueRange.last + 1, html.length)
+        return sb.toString()
+    }
+
+    /** Decode the subset of HTML entities the CSP attribute may legally contain. */
+    private fun htmlDecode(s: String): String =
+        s.replace("&#39;", "'")
+            .replace("&#x27;", "'")
+            .replace("&apos;", "'")
+            .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
+            .replace("&#x22;", "\"")
+            .replace("&amp;", "&")
+
+    /**
+     * Re-encode [s] for safe inclusion inside a double-quoted HTML attribute value, i.e.
+     * escape `"` and `&` (and `'` for readability/compat). Matches the form the cs-cloud
+     * extension itself emits (`&#39;`).
+     */
+    private fun htmlEncodeForDoubleQuotedAttr(s: String): String =
+        s.replace("&", "&amp;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
     /**
          * Update the HTML content of the WebView
          * @param data HTML update data
@@ -631,6 +829,65 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         }
 
         logger.warn("updateWebViewHtml: routing handle=${data.handle} -> viewType=${targetWebView.viewType}")
+
+        // Coalesce rapid $setHtml calls for the same handle while the page has
+        // not yet finished loading. The cs-cloud sidebar sets a short loading
+        // page and then (a few ms later) the real static HTML once the cs-cloud
+        // daemon is ready; loading both in quick succession races inside JCEF
+        // and the stale loading HTML can win, leaving the UI stuck. Once the
+        // page has loaded at least once we skip the debounce so that legitimate
+        // follow-up updates (e.g. theme changes) are applied immediately.
+        if (!targetWebView.isPageLoaded()) {
+            val seq = htmlUpdateSeq.merge(data.handle, 1L, Long::plus) ?: 1L
+            logger.info("updateWebViewHtml: debouncing handle=${data.handle} seq=$seq htmlLength=${data.htmlContent.length}")
+            debounceScope.launch {
+                delay(HTML_UPDATE_DEBOUNCE_MS)
+                // Drop this scheduled load if the webview was torn down during
+                // the debounce window (e.g. window closed / plugin unload).
+                if (targetWebView.isDisposed()) {
+                    logger.info("updateWebViewHtml: target disposed during debounce, dropping handle=${data.handle} seq=$seq")
+                    return@launch
+                }
+                // Only proceed if no newer update for this handle has arrived
+                // since we scheduled ourselves; otherwise a newer coroutine owns
+                // the final loadUrl and we must drop this (stale) payload.
+                val current = htmlUpdateSeq[data.handle]
+                if (current != null && current != seq) {
+                    logger.info("updateWebViewHtml: superseded handle=${data.handle} seq=$seq (current=$current), dropping")
+                    return@launch
+                }
+                // JCEF's loadURL must be invoked on the EDT. The non-debounced
+                // path runs synchronously on the caller's thread (already EDT
+                // in practice); here we explicitly hop back so behaviour stays
+                // identical.
+                ApplicationManager.getApplication().invokeLater {
+                    if (targetWebView.isDisposed()) {
+                        return@invokeLater
+                    }
+                    performUpdateWebViewHtml(data, targetWebView)
+                }
+            }
+            return
+        }
+
+        performUpdateWebViewHtml(data, targetWebView)
+    }
+
+    /**
+     * Undebounced implementation that actually rewrites the HTML (nonce mock,
+     * env injection, theme styles) and triggers the JCEF loadUrl/loadHtml.
+     * Called either directly (page already loaded) or after the debounce window
+     * in [updateWebViewHtml].
+     */
+    private fun performUpdateWebViewHtml(data: WebviewHtmlUpdateData, targetWebView: WebViewInstance) {
+        if (targetWebView.isDisposed()) {
+            logger.warn("updateWebViewHtml: target already disposed, skipping handle=${data.handle}")
+            return
+        }
+        // Clear the debounce bookkeeping once we are about to commit a load so
+        // that the next first-load cycle (e.g. after a dispose/recreate) starts
+        // fresh.
+        htmlUpdateSeq.remove(data.handle)
 
         val encodedState = targetWebView.state.toString().replace("\"", "\\\"")
         val htmlLengthBefore = data.htmlContent.length
@@ -700,9 +957,23 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
             data.htmlContent = data.htmlContent.replaceFirst(openingTag, "$openingTag$vscodeApiMock")
             logger.warn("updateWebViewHtml: injected mock via nonce script tag: '${openingTag.take(80)}...'")
         } else {
-            // --- Strategy 2 (fallback): wrap mock in its own <script> block and ---
-            // --- inject right before </head> (or, failing that, before <body>). ---
-            val fallbackScript = "<script>$vscodeApiMock</script>"
+            // --- Strategy 2 (fallback): no <script nonce="…"> tag in the HTML.   ---
+            // --- This happens for the cs-cloud loading/error HTML, whose CSP is  ---
+            // --- `default-src 'none'; style-src 'unsafe-inline'` with no          ---
+            // --- script-src directive — every inline script is blocked by CSP,   ---
+            // --- so a bare <script>…</script> would be silently refused and the   ---
+            // --- webview would stay stuck on the loading screen.                  ---
+            // --- Fix: generate a fresh nonce, rewrite the CSP <meta> to allow     ---
+            // --- scripts carrying that nonce, then inject the mock with it.       ---
+            val fallbackNonce = generateNonce()
+
+            // Rewrite the CSP meta so the injected script is permitted.
+            val cspBefore = data.htmlContent
+            data.htmlContent = allowNonceInCsp(data.htmlContent, fallbackNonce)
+            val cspRewritten = data.htmlContent != cspBefore
+            logger.warn("updateWebViewHtml: fallback nonce=$fallbackNonce, cspRewritten=$cspRewritten")
+
+            val fallbackScript = "<script nonce=\"$fallbackNonce\">$vscodeApiMock</script>"
             val headCloseIdx = data.htmlContent.indexOf("</head>")
             if (headCloseIdx >= 0) {
                 data.htmlContent = data.htmlContent.substring(0, headCloseIdx) +
@@ -715,9 +986,6 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
                 logger.warn("updateWebViewHtml: injected mock via prepend fallback")
             }
             // Diagnostic: log the first few script tags for debugging.
-            // This is expected for loading HTML (no scripts) and error HTML
-            // (bare <script> without nonce).  The fallback injection above
-            // already handles these cases correctly.
             val allScriptTags = """<script\b[^>]*>""".toRegex().findAll(data.htmlContent).take(5).map { it.value }.toList()
             logger.warn("updateWebViewHtml: nonce regex DID NOT MATCH (expected for loading/error HTML). First 5 script tags: $allScriptTags, contains 'nonce=': ${data.htmlContent.contains("nonce=")}")
         }
@@ -729,6 +997,7 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         logger.warn("updateWebViewHtml: after mock injection htmlLength=${data.htmlContent.length} (delta=${data.htmlContent.length - htmlLengthBefore})")
 
         data.htmlContent = injectEnvironmentVariables(data.htmlContent)
+        data.htmlContent = injectInitialClassicThemeStyles(data.htmlContent, targetWebView)
         logger.warn("updateWebViewHtml: after env injection htmlLength=${data.htmlContent.length}, handle=${data.handle}")
         
         val webView = targetWebView
@@ -942,13 +1211,26 @@ class WebViewInstance(
                 // Remove cssContent property from the copy
                 themeConfigCopy.remove("cssContent")
 
+                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
+                val isCloudUi = viewType == "costrict.AssistantUISidebarProvider"
                 // Inject CSS variables into WebView
                 if (cssContent != null) {
                     val injectThemeScript = """
                         (function() {
+                            const assistantUITheme = "$assistantUITheme";
+                            const isCloudUi = $isCloudUi;
                             console.log("Ready to inject CSS variables into WebView")
                             function injectCSSVariables() {
                                 if(document.documentElement) {
+                                    if (isCloudUi) {
+                                        document.documentElement.classList.toggle('dark', assistantUITheme === 'dark');
+                                    }
+                                    if (document.body && !isCloudUi) {
+                                        const themeKind = assistantUITheme === 'light' ? 'vscode-light' : 'vscode-dark';
+                                        document.body.classList.toggle('vscode-light', themeKind === 'vscode-light');
+                                        document.body.classList.toggle('vscode-dark', themeKind === 'vscode-dark');
+                                        document.body.dataset.vscodeThemeKind = themeKind;
+                                    }
                                     // Convert cssContent to style attribute of html tag
                                     try {
                                         // Extract CSS variables (format: --name:value;)
@@ -988,10 +1270,10 @@ class WebViewInstance(
                                             document.head.appendChild(defaultStylesElement);
                                         }
 
-                                        // Add default_themes.css content
+                                        // Add default_themes.css content.
                                         // Cloud UI (AssistantUISidebarProvider) is a complete web app with its own
-                                        // layout system — skip body styles that would conflict with its layout.
-                                        const isCloudUi = ${this.viewType == "costrict.AssistantUISidebarProvider"};
+                                        // light/dark theme classes. Apply that class above and only inject shared
+                                        // VS Code variables/scrollbar styles plus the theme message.
                                         defaultStylesElement.textContent = isCloudUi ? `
                                             html {
                                                 scrollbar-color: var(--vscode-scrollbarSlider-background) var(--vscode-editor-background);
@@ -1028,7 +1310,7 @@ class WebViewInstance(
 
                                             body {
                                                 overscroll-behavior-x: none;
-                                                background-color: transparent;
+                                                background-color: var(--vscode-editor-background);
                                                 color: var(--vscode-editor-foreground);
                                                 font-family: var(--vscode-font-family);
                                                 font-weight: var(--vscode-font-weight);
@@ -1105,7 +1387,8 @@ class WebViewInstance(
                                             }
 
                                             *, *::before, *::after { box-sizing: border-box; }
-                                            html, body { width: 100%; height: 100%; }
+                                            html, body { width: 100%; height: 100%; background-color: var(--vscode-editor-background); }
+                                            #root { min-height: 100%; background-color: var(--vscode-editor-background); }
 
                                             ::-webkit-scrollbar-thumb {
                                                 background-color: var(--vscode-scrollbarSlider-background);
@@ -1148,7 +1431,6 @@ class WebViewInstance(
 
                 // Pass the theme config without cssContent via message
                 val themeConfigJson = gson.toJson(themeConfigCopy)
-                val assistantUITheme = if (ThemeManager.getInstance().isDarkThemeForce()) "dark" else "light"
                 val message = """
                     {
                         "type": "theme",
@@ -1214,6 +1496,78 @@ class WebViewInstance(
             """.trimIndent()
             executeJavaScript(script)
         }
+    }
+
+    companion object {
+        /**
+         * URL schemes that should be delegated to the OS default browser when the
+         * embedded webview tries to navigate to them. Everything else (e.g.
+         * `file`, `vscode-file`, `vscode`, `vscode-resource`, `command`, `data`,
+         * `about`, `chrome`) is considered editor-internal and must NOT be sent
+         * to the browser. See [isExternalBrowserUrl].
+         */
+        private val EXTERNAL_BROWSER_SCHEMES = setOf("http", "https", "mailto", "ftp")
+
+        /**
+         * Loopback host literals. The embedded webview talks to several local
+         * services over http:
+         *   - `http://localhost:12345/...` serves the webview's own HTML/assets,
+         *   - `http://127.0.0.1:<port>/...` is the CoStrict backend API (port
+         *     assigned dynamically) consumed by the Cloud UI SPA.
+         * Navigations/fetches to any of these must NEVER be redirected to the OS
+         * default browser — doing so breaks the SPA's bootstrap (it never
+         * receives API responses and stays on the loading screen).
+         */
+        private val LOOPBACK_HOSTS = setOf("localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1")
+    }
+
+    /**
+     * @return `true` only when [url] is an external link that should be opened in
+     *         the OS default browser. Returns `false` for:
+     *         - any loopback origin (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`)
+     *           — the webview's own assets and the CoStrict backend API live there,
+     *         - editor-internal schemes (`file:`, `vscode-file:`, `command:`, ...)
+     *           — handled by the frontend's `openFile` postMessage path or ignored,
+     *         - malformed URLs (no scheme / unparseable).
+     */
+    private fun isExternalBrowserUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val schemeEnd = url.indexOf(':')
+        if (schemeEnd <= 0) return false
+        val scheme = url.substring(0, schemeEnd).lowercase(Locale.ROOT)
+        if (scheme !in EXTERNAL_BROWSER_SCHEMES) return false
+        // http/https/ftp carry an authority — check the host. mailto has none.
+        val host = try {
+            java.net.URI(url).host?.lowercase(Locale.ROOT)
+        } catch (_: Throwable) {
+            null
+        }
+        // If we cannot determine the host, do NOT delegate to the browser —
+        // safer to drop the navigation than to risk breaking a local service.
+        if (host == null) return false
+        return host !in LOOPBACK_HOSTS
+    }
+
+    /**
+     * @return `true` if [url] is an `http(s)` URL whose host is a loopback
+     *         literal (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`). These
+     *         origins serve the webview's own assets (e.g.
+     *         `http://localhost:12345`) and the CoStrict backend API (e.g.
+     *         `http://127.0.0.1:<port>`) consumed by the Cloud UI SPA, and
+     *         must be allowed to proceed inside the embedded webview.
+     */
+    private fun isLoopbackHttpUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val schemeEnd = url.indexOf(':')
+        if (schemeEnd <= 0) return false
+        val scheme = url.substring(0, schemeEnd).lowercase(Locale.ROOT)
+        if (scheme != "http" && scheme != "https") return false
+        val host = try {
+            java.net.URI(url).host?.lowercase(Locale.ROOT)
+        } catch (_: Throwable) {
+            null
+        } ?: return false
+        return host in LOOPBACK_HOSTS
     }
 
     /**
@@ -1319,12 +1673,36 @@ class WebViewInstance(
                     user_gesture: Boolean,
                     is_redirect: Boolean
                 ): Boolean {
-                    logger.debug("onBeforeBrowse,url:${request?.url}")
-                    if(request?.url?.startsWith("http://localhost") == false){
-                        BrowserUtil.browse(request.url)
-                        return true
+                    val url = request?.url
+                    logger.debug("onBeforeBrowse,url:$url")
+                    // Three navigation classes:
+                    //   1. Loopback http(s) (localhost / 127.0.0.1 / ::1 / 0.0.0.0):
+                    //      the webview's own assets (http://localhost:12345) AND the
+                    //      CoStrict backend API (http://127.0.0.1:<dynamic port>)
+                    //      consumed by the Cloud UI SPA. MUST let through unchanged.
+                    //   2. Genuine external links (non-loopback http/https/mailto/ftp):
+                    //      hand to the OS default browser via safeBrowse.
+                    //   3. Editor-internal schemes (file://, vscode-file://, vscode://,
+                    //      command:, data:, about:, chrome:, ...): local-file clicks
+                    //      are handled by the frontend's `openFile` postMessage path,
+                    //      which opens them in the editor via FileEditorManager.
+                    //      Previously these were *also* sent to BrowserUtil.browse,
+                    //      causing the OS browser to open the path in addition to the
+                    //      editor — now we just cancel the in-webview navigation.
+                    return when {
+                        // Class 1: let the webview proceed (return false = do not cancel).
+                        isLoopbackHttpUrl(url) -> false
+                        // Class 2: external link -> OS browser. BrowserUtil.browse can
+                        // throw on intranet/headless machines (e.g. "Desktop API is not
+                        // supported"); this callback runs on the JCEF UI thread, so an
+                        // uncaught throwable freezes/crashes the webview -> safeBrowse.
+                        isExternalBrowserUrl(url) -> {
+                            NotificationUtil.safeBrowse(url)
+                            true
+                        }
+                        // Class 3: editor-internal / malformed -> swallow.
+                        else -> true
                     }
-                    return false
                 }
 
                 override fun getResourceRequestHandler(

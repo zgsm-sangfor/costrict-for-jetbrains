@@ -31,8 +31,8 @@ import com.sina.weibo.agent.editor.Range
 import com.sina.weibo.agent.editor.ModelAddedData
 import com.sina.weibo.agent.editor.createURI
 import com.sina.weibo.agent.util.URI
+import com.sina.weibo.agent.util.NotificationUtil
 import com.sina.weibo.agent.actions.executeCommand
-import com.intellij.ide.BrowserUtil
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.awt.RelativePoint
 import com.intellij.ui.components.JBLabel
@@ -1035,11 +1035,11 @@ class CommentManager(private val project: Project) : Disposable {
             border = JBUI.Borders.empty(6, 0, 0, 0)
             font = UIUtil.getLabelFont()
             putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, true)
-            addHyperlinkListener { event ->
-                if (event.eventType == HyperlinkEvent.EventType.ACTIVATED) {
-                    event.url?.let { BrowserUtil.browse(it) }
+                addHyperlinkListener { event ->
+                    if (event.eventType == HyperlinkEvent.EventType.ACTIVATED) {
+                        event.url?.let { NotificationUtil.safeBrowse(it.toString()) }
+                    }
                 }
-            }
         }
         itemPanel.add(bodyPane)
         return itemPanel
