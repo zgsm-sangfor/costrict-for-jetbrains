@@ -113,6 +113,24 @@ You can download the pre-built plugin from our GitHub releases page:
 
 3. **Verify Installation**: After restart, you should see the Costrict plugin in your IDE's plugin list
 
+### Enable Auto-Update (Recommended for Internet Users)
+
+If you can reach the public internet, configure a custom plugin repository once. After that, Costrict checks for and prompts upgrades inside the IDE just like a Marketplace plugin — no manual zip download needed.
+
+1. **Add the update channel**:
+
+   - Open your JetBrains IDE, go to `Settings/Preferences` → `Plugins`
+   - Click the gear icon ⚙️ → `Manage Plugin Repositories...`
+   - Click `+`, paste the URL below and save:
+
+     ```
+     https://zgsm-sangfor.github.io/costrict-for-jetbrains/updatePlugins.xml
+     ```
+
+2. **Check for updates**: Restart the IDE or click `Check for updates` on the Plugins page. When a newer version is available, the IDE shows an upgrade prompt.
+
+> Intranet / offline environments do not need this channel — keep installing the zip manually via "Download from GitHub Releases" above.
+
 ### Build from Source
 
 #### Prerequisites

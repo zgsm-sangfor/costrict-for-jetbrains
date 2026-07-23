@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CoStrict private update channel.
+  Users add this URL to: Settings -> Plugins -> Gear icon -> Manage Plugin Repositories
+    https://zgsm-sangfor.github.io/costrict-for-jetbrains/updatePlugins.xml
+
+  The url below points at the universal/lite bundle, which contains the Java
+  plugin + JS resources but NOT the Node.js binary. After an auto-update the
+  plugin downloads the platform-specific Node.js on first launch via
+  scripts/setup-node-online.{sh,bat} (see ExtensionProcessManager.findNodeExecutable).
+  Platform bundles (CoStrict-<ver>-<os>-<arch>.zip) with builtin Node.js are
+  only for first-time offline install, not used by this channel.
+
+  Intranet/offline users can keep installing the zip from GitHub Releases manually.
+  This file is republished by scripts/publish-channel.sh on every release.
+-->
+<plugins>
+  <plugin
+      id="CoStrict"
+      version="3.0.17"
+      url="https://github.com/zgsm-sangfor/costrict-for-jetbrains/releases/download/v3.0.17/CoStrict-3.0.17.zip">
+    <name>CoStrict</name>
+    <idea-version since-build="233" until-build="252.*"/>
+    <description>CoStrict AI Coding Assistant</description>
+  </plugin>
+</plugins>

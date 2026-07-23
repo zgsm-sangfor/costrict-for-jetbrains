@@ -113,6 +113,24 @@ graph TB
 
 3. **验证安装**：重启后，您应该在 IDE 的插件列表中看到 Costrict 插件
 
+### 启用自动更新（外网用户推荐）
+
+如果您能访问外网，只需配置一次自定义更新源，此后 Costrict 将像官方商店插件一样在 IDE 内自动检查并提示升级，无需手动下载 zip。
+
+1. **添加更新源**：
+
+   - 打开 JetBrains IDE，转到 `设置/首选项` → `插件`
+   - 点击齿轮图标 ⚙️ → `管理插件仓库...`（Manage Plugin Repositories）
+   - 点击 `+`，填入下面的 URL 并保存：
+
+     ```
+     https://zgsm-sangfor.github.io/costrict-for-jetbrains/updatePlugins.xml
+     ```
+
+2. **检查更新**：重启 IDE 或在插件页点击 `Check for updates`。当有新版本时，IDE 会弹窗提示一键升级。
+
+> 内网 / 离线环境无需配置更新源，继续按上面「从 GitHub Releases 下载」的方式手动安装 zip 即可。
+
 ### 从源码构建
 
 #### 前置条件
