@@ -10,6 +10,7 @@ import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.callback.CefCallback
 import org.cef.handler.CefResourceHandler
+import org.cef.handler.CefResourceHandlerAdapter
 import org.cef.handler.CefResourceRequestHandlerAdapter
 import org.cef.misc.IntRef
 import org.cef.misc.StringRef
@@ -26,7 +27,7 @@ class LocalResHandler(val resourcePath:String , val request: CefRequest?) : CefR
 
 }
 
-class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) : CefResourceHandler{
+class LocalCefResHandle(val resourceBasePath: String, val request: CefRequest?) : CefResourceHandlerAdapter() {
     private val logger = Logger.getInstance(LocalCefResHandle::class.java)
 
     private var file: File? = null
