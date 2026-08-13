@@ -267,7 +267,10 @@ intellij {
     plugins.set(
         listOf(
             "com.intellij.java",
-            // Add JCEF support
+            // JCEF needs no entry here: against the 2023.3 build SDK its classes ship
+            // inside the platform core, so they are already on the compile classpath.
+            // Runtime visibility on 2026.2+ (where JCEF was extracted into a separate
+            // bundled module) is declared in plugin.xml via com.intellij.modules.jcef.
             "org.jetbrains.plugins.terminal"
         )
     )

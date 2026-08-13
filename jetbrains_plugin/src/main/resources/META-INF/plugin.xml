@@ -82,6 +82,13 @@ It supports users in conducting code checks on functions, selected code lines, c
          Read more: https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html -->
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.plugins.terminal</depends>
+
+    <!-- Since IntelliJ 2026.2 (build 262) JCEF has been extracted from the platform
+         core into a separate bundled "Web Browser (JCEF)" module. Its classes
+         (com.intellij.ui.jcef.*) are only visible to plugins that declare this
+         dependency. It is optional so older IDEs (where JCEF still ships inside the
+         platform core) keep loading the plugin unchanged. -->
+    <depends optional="true" config-file="jcef-support.xml">com.intellij.modules.jcef</depends>
     
     <!-- Extension points defined by the plugin.
          Read more: https://plugins.jetbrains.com/docs/intellij/plugin-extension-points.html -->

@@ -25,12 +25,12 @@ import java.io.InputStream
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.util.SystemInfo
-import com.intellij.ui.jcef.JBCefApp
 import com.intellij.openapi.application.ApplicationInfo
 import com.sina.weibo.agent.core.*
 import com.sina.weibo.agent.extensions.core.ExtensionConfigurationManager
 import com.sina.weibo.agent.extensions.core.ExtensionManager
 import com.sina.weibo.agent.util.ExtensionUtils
+import com.sina.weibo.agent.util.JcefSupport
 import com.sina.weibo.agent.util.PluginConstants
 import com.sina.weibo.agent.util.PluginResourceUtil
 import com.sina.weibo.agent.env.EnvSnapshotWriter
@@ -74,7 +74,7 @@ class WecoderPlugin : StartupActivity.DumbAware {
             "OS: $osName $osVersion ($osArch), " +
             "IDE: ${appInfo.fullApplicationName} (build ${appInfo.build}), " +
             "Plugin version: $pluginVersion, " +
-            "JCEF supported: ${JBCefApp.isSupported()}"
+            "JCEF supported: ${JcefSupport.isSupported()}"
         )
 
         try {

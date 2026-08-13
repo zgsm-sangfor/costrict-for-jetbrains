@@ -1,0 +1,12 @@
+<idea-plugin>
+    <!--
+        Loaded only when the `com.intellij.modules.jcef` module is available
+        (IntelliJ 2026.2+, where JCEF ships as a separate bundled plugin).
+
+        We have no JCEF-specific <extensions> to register conditionally, so this
+        descriptor intentionally contains nothing beyond the root element. It
+        exists to satisfy the optional <depends config-file="..."> contract in
+        plugin.xml and, more importantly, to establish the classloader parent
+        link that makes com.intellij.ui.jcef.* visible to this plugin.
+    -->
+</idea-plugin>

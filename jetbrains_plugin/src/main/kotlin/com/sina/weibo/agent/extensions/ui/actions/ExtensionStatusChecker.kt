@@ -21,8 +21,8 @@ import com.sina.weibo.agent.util.ProxyConfigUtil
 import com.sina.weibo.agent.webview.WebViewManager
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
-import com.intellij.ui.jcef.JBCefApp
 import com.intellij.openapi.application.ApplicationInfo
+import com.sina.weibo.agent.util.JcefSupport
 import com.sina.weibo.agent.util.PluginConstants
 
 /**
@@ -161,7 +161,7 @@ class ExtensionStatusChecker : AnAction("Check Extension Status") {
             val osName = System.getProperty("os.name")
             val osVersion = System.getProperty("os.version")
             val osArch = System.getProperty("os.arch")
-            val jcefSupported = JBCefApp.isSupported()
+            val jcefSupported = JcefSupport.isSupported()
             
             // Check for Linux ARM system
             val isLinuxArm = osName.lowercase().contains("linux") && (osArch.lowercase().contains("aarch64") || osArch.lowercase().contains("arm"))

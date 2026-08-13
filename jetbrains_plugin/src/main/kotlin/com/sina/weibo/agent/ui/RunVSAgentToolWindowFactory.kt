@@ -16,7 +16,6 @@ import com.intellij.ui.content.ContentFactory
 import com.intellij.ui.JBColor
 import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.extensions.PluginId
-import com.intellij.ui.jcef.JBCefApp
 import com.intellij.openapi.application.ApplicationInfo
 import com.sina.weibo.agent.actions.OpenDevToolsAction
 import com.sina.weibo.agent.core.ExtensionProcessManager
@@ -27,6 +26,7 @@ import com.sina.weibo.agent.webview.DragDropHandler
 import com.sina.weibo.agent.webview.WebViewCreationCallback
 import com.sina.weibo.agent.webview.WebViewInstance
 import com.sina.weibo.agent.webview.WebViewManager
+import com.sina.weibo.agent.util.JcefSupport
 import com.sina.weibo.agent.util.PluginConstants
 import com.sina.weibo.agent.extensions.core.ExtensionConfigurationManager
 import com.sina.weibo.agent.extensions.core.ExtensionManager
@@ -149,7 +149,7 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             val osName = System.getProperty("os.name")
             val osVersion = System.getProperty("os.version")
             val osArch = System.getProperty("os.arch")
-            val jcefSupported = JBCefApp.isSupported()
+            val jcefSupported = JcefSupport.isSupported()
 
             // Check for Linux ARM system
             val isLinuxArm = osName.lowercase().contains("linux") && (osArch.lowercase().contains("aarch64") || osArch.lowercase().contains("arm"))
@@ -571,7 +571,7 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             val osName = System.getProperty("os.name")
             val osVersion = System.getProperty("os.version")
             val osArch = System.getProperty("os.arch")
-            val jcefSupported = JBCefApp.isSupported()
+            val jcefSupported = JcefSupport.isSupported()
 
             // Check for Linux ARM system
             val isLinuxArm = osName.lowercase().contains("linux") && (osArch.lowercase().contains("aarch64") || osArch.lowercase().contains("arm"))

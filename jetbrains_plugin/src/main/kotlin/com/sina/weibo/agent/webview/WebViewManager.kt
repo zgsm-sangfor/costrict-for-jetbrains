@@ -22,6 +22,7 @@ import com.sina.weibo.agent.ipc.proxy.SerializableObjectWithBuffers
 import com.sina.weibo.agent.theme.ThemeChangeListener
 import com.sina.weibo.agent.theme.ThemeManager
 import com.sina.weibo.agent.util.ConfigFileUtils
+import com.sina.weibo.agent.util.JcefSupport
 import com.sina.weibo.agent.util.NotificationUtil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -429,6 +430,18 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
      */
     fun registerProvider(data: WebviewViewProviderData) {
         logger.debug("Register WebView provider and create WebView instance: ${data.viewType}")
+
+        // JCEF is required to construct a WebViewInstance (it builds a JBCefBrowser at
+        // init). Since IntelliJ 2026.2, JCEF may be absent from the classpath; bail out
+        // early so we never trigger NoClassDefFoundError. The tool window keeps showing
+        // its "JCEF not supported" placeholder instead of crashing.
+        if (!JcefSupport.isSupported()) {
+            logger.error(
+                "Cannot create WebView for ${data.viewType}: JCEF is not available in this IDE runtime. " +
+                    "On IntelliJ 2026.2+ make sure the bundled \"Web Browser (JCEF)\" plugin is enabled."
+            )
+            return
+        }
 
         // ── Clean up stale WebViewInstances left behind by extension-host reloads ──
         // When the VSCode extension host restarts (e.g. after switching UI mode) the
