@@ -50,6 +50,34 @@ object PluginConstants {
          * Defaults to true to preserve existing rendering behavior.
          */
         const val WEBVIEW_OFFSCREEN_RENDERING_KEY = "webview.offscreen.rendering"
+
+        /**
+         * Master switch for the periodic WebView render-refresh watchdog.
+         * When enabled, a low-frequency "fake resize" is sent to the JCEF
+         * browser so stale / frozen UI frames get re-composited without the
+         * user having to drag the tool window. Defaults to true.
+         */
+        const val WEBVIEW_REFRESH_ENABLED_KEY = "webview.refresh.enabled"
+
+        /**
+         * Interval (ms) between periodic render-refresh nudges.
+         * Defaults to 2000. Values are clamped to [200, 60000].
+         *
+         * Shorter = fresher JS-driven updates (streaming tokens) but more
+         * frequent page reflows; longer = cheaper but laggier streaming.
+         * Plugin-bridge content updates are flushed ~150ms after they arrive
+         * regardless of this value.
+         */
+        const val WEBVIEW_REFRESH_INTERVAL_KEY = "webview.refresh.interval"
+
+        /**
+         * Enable the "dirty pixel" mode: instead of only notifying CEF with the
+         * same size, the refresh performs a 1px resize-and-restore cycle so the
+         * native window really changes size and CEF is forced through its full
+         * resize -> re-layout -> re-composite path (exactly what a manual tool
+         * window drag does). Defaults to true.
+         */
+        const val WEBVIEW_REFRESH_DIRTY_PIXEL_KEY = "webview.refresh.dirtyPixel"
         
         /**
          * Get user home directory for configuration storage

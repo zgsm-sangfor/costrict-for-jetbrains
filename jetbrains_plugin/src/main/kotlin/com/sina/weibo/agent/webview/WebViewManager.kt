@@ -1163,6 +1163,23 @@ class WebViewInstance(
 
     private var isPageLoaded = false
 
+    /**
+     * Callback invoked by [markRenderDirty] whenever the page content changed.
+     * The tool window uses it to trigger a fast (non-periodic) render refresh
+     * right after content updates instead of waiting for the next watchdog tick.
+     * Must be thread-safe: it may be called from IPC / JCEF threads.
+     */
+    @Volatile
+    private var renderRefreshListener: (() -> Unit)? = null
+
+    /**
+     * Alternating dirty-pixel axis (horizontal/vertical). Alternating halves the
+     * chance that a page with a responsive breakpoint exactly at (width-1) or
+     * (height-1) keeps visibly reflowing on every nudge.
+     */
+    @Volatile
+    private var dirtyPixelAxisHorizontal = true
+
     // Last URL successfully passed to loadUrl(). Used by reloadLastUrl() to
     // re-load the current page (e.g. after the extension-host socket dies and
     // the cloud UI must reconnect to the still-running cs-cloud daemon without
@@ -1208,11 +1225,82 @@ class WebViewInstance(
     fun setPageLoadCallback(callback: ((success: Boolean, errorInfo: String?) -> Unit)?) {
         pageLoadCallback = callback
     }
+
+    /**
+     * Mark the webview content as changed since the last rendered frame.
+     * Called on every content-mutating operation (HTML load, postMessage,
+     * theme injection) so the render-refresh watchdog knows a new frame is
+     * pending and can flush it promptly. Safe to call from any thread.
+     */
+    fun markRenderDirty() {
+        if (isDisposed) return
+        renderRefreshListener?.invoke()
+    }
+
+    /**
+     * Register a listener invoked by [markRenderDirty]. The tool window uses
+     * this to schedule a fast render refresh shortly after content updates.
+     * Pass `null` to unregister.
+     */
+    fun setRenderRefreshListener(listener: (() -> Unit)?) {
+        renderRefreshListener = listener
+    }
+
+    /**
+     * Force JCEF to re-composite a fresh frame by simulating a hosting-window
+     * resize — exactly what a manual tool-window drag does, which is the
+     * user-visible fix for the stale / "frozen" UI (see KNOWN_ISSUES.md §1.4).
+     *
+     * Must be called on the EDT (the tool window schedules it from a
+     * [javax.swing.Timer], which fires on the EDT).
+     *
+     * Strategy (all steps are harmless no-ops when the browser is healthy):
+     *  1. [CefBrowser.wasResized] with the current size — a cheap "kick" that
+     *     tells CEF the widget was resized;
+     *  2. "dirty pixel": when enabled, a 1px resize-and-restore cycle on an
+     *     alternating axis so the native window really changes size and CEF
+     *     goes through its full resize -> re-layout -> re-composite path;
+     *  3. repaint the Swing side.
+     */
+    fun forceRenderRefresh() {
+        if (isDisposed) return
+        // `wasResized` is only meaningful for windowed rendering; OSR mode has
+        // its own paint loop and would ignore the nudge anyway.
+        if (browser.isOffScreenRendering()) return
+        try {
+            val component = browser.component ?: return
+            if (!component.isShowing) return
+            val width = component.width
+            val height = component.height
+            if (width <= 0 || height <= 0) return
+
+            val cefBrowser = browser.cefBrowser
+
+            // 1. Same-size resize notification (cheap kick).
+            cefBrowser.wasResized(width, height)
+
+            // 2. Dirty pixel: 1px smaller then restore, alternating axis.
+            if (ConfigFileUtils.isWebViewRefreshDirtyPixelEnabled()) {
+                val nudgeWidth = if (dirtyPixelAxisHorizontal) width - 1 else width
+                val nudgeHeight = if (dirtyPixelAxisHorizontal) height else height - 1
+                cefBrowser.wasResized(nudgeWidth, nudgeHeight)
+                cefBrowser.wasResized(width, height)
+                dirtyPixelAxisHorizontal = !dirtyPixelAxisHorizontal
+            }
+
+            // 3. Swing side.
+            component.repaint()
+            logger.debug("WebView render refresh triggered: $viewType/$viewId (${width}x$height)")
+        } catch (e: Exception) {
+            logger.debug("WebView render refresh failed: $viewType/$viewId", e)
+        }
+    }
     
     private fun injectTheme() {
         if(currentThemeConfig == null) {
             return
         }
+        markRenderDirty()
         try {
             var cssContent: String? = null
 
@@ -1508,6 +1596,7 @@ class WebViewInstance(
                 }
             """.trimIndent()
             executeJavaScript(script)
+            markRenderDirty()
         }
     }
 
@@ -1752,6 +1841,7 @@ class WebViewInstance(
             logger.debug("WebView loading URL: $url")
             lastLoadedUrl = url
             browser.loadURL(url)
+            markRenderDirty()
         }
     }
 
@@ -1772,6 +1862,7 @@ class WebViewInstance(
             logger.info("reloadLastUrl: reloading $viewType/$viewId from $url")
             isPageLoaded = false
             browser.loadURL(url)
+            markRenderDirty()
         }
     }
     
@@ -1786,6 +1877,7 @@ class WebViewInstance(
             }else {
                 browser.loadHTML(html)
             }
+            markRenderDirty()
         }
     }
     

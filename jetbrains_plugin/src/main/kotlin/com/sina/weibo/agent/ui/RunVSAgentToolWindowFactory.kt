@@ -8,8 +8,10 @@ import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.content.ContentFactory
@@ -44,6 +46,7 @@ import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.BorderFactory
+import javax.swing.Timer
 import com.intellij.util.ui.JBFont
 import com.intellij.util.ui.JBUI
 import com.sina.weibo.agent.util.ConfigFileUtils
@@ -644,6 +647,24 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
 
         private var dragDropHandler: DragDropHandler? = null
 
+        /**
+         * Periodic render-refresh watchdog timers (see [startWebViewRefreshTimer]).
+         *
+         * - [refreshRenderTimer] fires every configured interval and fakes a
+         *   hosting-window resize on the current webview, so JCEF re-composites
+         *   fresh frames even for JS-driven updates (streaming tokens etc.).
+         * - [flushRenderTimer] is a one-shot timer that fires shortly after any
+         *   discrete content update ([WebViewInstance.markRenderDirty]) so the
+         *   refresh happens promptly instead of waiting for the next tick.
+         *
+         * Both fire on the EDT and are disposed with the tool window.
+         */
+        private var refreshRenderTimer: Timer? = null
+        private var flushRenderTimer: Timer? = null
+
+        /** Delay before the post-update flush refresh fires (ms). */
+        private val renderFlushDelayMs = 150
+
         // Main panel
         val content: JPanel = JPanel(BorderLayout()).apply {
             // Match the JCEF webview clear colour to avoid a contrasting flash
@@ -677,12 +698,18 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             // Add theme change listener
             addThemeChangeListener()
 
+            // Start periodic render-refresh watchdog (fake resize) so the JCEF
+            // webview keeps compositing fresh frames (stale/frozen UI fix).
+            startWebViewRefreshTimer()
+
             // Try to get existing WebView
             webViewManager.getLatestWebView()?.let { webView ->
                 // Add WebView component immediately when created
                 ApplicationManager.getApplication().invokeLater {
                     addWebViewComponent(webView)
                 }
+                // Route content updates (dirty marking) to the fast flush timer
+                bindRenderRefreshListener(webView)
                 // Set page load callback to hide system info only after page is loaded
                 webView.setPageLoadCallback { success, errorInfo ->
                     ApplicationManager.getApplication().invokeLater {
@@ -773,6 +800,99 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         /**
+         * Start the periodic render-refresh watchdog for the JCEF webview.
+         *
+         * Problem: JCEF windowed rendering sometimes stops compositing new
+         * frames until the native window is resized — the plugin UI looks
+         * stale / "frozen" (花屏/假死) even though the page updated. Dragging
+         * the tool window fixes it because the resize forces CEF to re-render.
+         * This watchdog replicates that fix automatically:
+         *
+         *  - a periodic [Timer] fakes a hosting-window resize every
+         *    `webview.refresh.interval` ms (default 2000) via
+         *    [WebViewInstance.forceRenderRefresh] — covers JS-driven updates
+         *    (streaming tokens, animations) that never cross the plugin bridge;
+         *  - a one-shot flush [Timer] fires ~[renderFlushDelayMs] ms after any
+         *    discrete content update ([WebViewInstance.markRenderDirty]) so
+         *    HTML/message/theme updates repaint promptly.
+         *
+         * Config keys (in ~/.costrict-jetbrains/.vscode-agent):
+         *  - webview.refresh.enabled=false      disable entirely
+         *  - webview.refresh.interval=2000      change the period (200..60000)
+         *  - webview.refresh.dirtyPixel=false   notify only, no 1px resize cycle
+         */
+        private fun startWebViewRefreshTimer() {
+            if (!ConfigFileUtils.isWebViewRefreshEnabled()) {
+                logger.info("WebView periodic render refresh disabled via webview.refresh.enabled=false")
+                return
+            }
+            try {
+                val interval = ConfigFileUtils.getWebViewRefreshIntervalMs()
+
+                // Fast flush: one-shot, fires shortly after a content update.
+                flushRenderTimer = Timer(renderFlushDelayMs) {
+                    flushRenderTimer?.stop()
+                    nudgeCurrentWebViewRender()
+                }
+                flushRenderTimer?.isRepeats = false
+
+                // Watchdog: periodic unconditional fake resize.
+                refreshRenderTimer = Timer(interval) {
+                    nudgeCurrentWebViewRender()
+                }
+                refreshRenderTimer?.isRepeats = true
+                refreshRenderTimer?.start()
+
+                // Route dirty-marking from the current webview into the fast flush.
+                webViewManager.getLatestWebView()?.let { bindRenderRefreshListener(it) }
+
+                Disposer.register(toolWindow.disposable, Disposable {
+                    refreshRenderTimer?.stop()
+                    flushRenderTimer?.stop()
+                    refreshRenderTimer = null
+                    flushRenderTimer = null
+                    webViewManager.getLatestWebView()?.setRenderRefreshListener(null)
+                })
+                logger.info(
+                    "WebView periodic render refresh started: interval=${interval}ms, " +
+                        "dirtyPixel=${ConfigFileUtils.isWebViewRefreshDirtyPixelEnabled()}"
+                )
+            } catch (e: Exception) {
+                logger.error("Failed to start WebView periodic render refresh", e)
+            }
+        }
+
+        /**
+         * Route [WebViewInstance.markRenderDirty] calls (content updates) to the
+         * fast flush timer. [javax.swing.Timer] is not thread-safe and
+         * [WebViewInstance.markRenderDirty] may be invoked from IPC / JCEF
+         * threads, so the timer is always touched on the EDT.
+         */
+        private fun bindRenderRefreshListener(webView: WebViewInstance) {
+            webView.setRenderRefreshListener {
+                ApplicationManager.getApplication().invokeLater {
+                    val flush = flushRenderTimer ?: return@invokeLater
+                    if (flush.isRunning) flush.restart() else flush.start()
+                }
+            }
+        }
+
+        /**
+         * Nudge the currently visible webview into re-rendering. No-op when the
+         * webview is missing, disposed or not showing (tool window hidden).
+         */
+        private fun nudgeCurrentWebViewRender() {
+            try {
+                if (project.isDisposed) return
+                val webView = webViewManager.getLatestWebView() ?: return
+                if (webView.isDisposed()) return
+                webView.forceRenderRefresh()
+            } catch (e: Exception) {
+                logger.debug("WebView render refresh nudge failed", e)
+            }
+        }
+
+        /**
          * WebView creation callback implementation
          */
         override fun onWebViewCreated(instance: WebViewInstance) {
@@ -780,6 +900,8 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
             ApplicationManager.getApplication().invokeLater {
                 addWebViewComponent(instance)
             }
+            // Route content updates (dirty marking) to the fast flush timer
+            bindRenderRefreshListener(instance)
             // Set page load callback to hide system info only after page is loaded
             instance.setPageLoadCallback { success, errorInfo ->
                 // Ensure UI update in EDT thread
@@ -799,6 +921,7 @@ class RunVSAgentToolWindowFactory : ToolWindowFactory, DumbAware {
          */
         override fun removeWebViewComponent(webView: WebViewInstance) {
             logger.info("Removing WebView component from UI: ${webView.viewType}/${webView.viewId}")
+            webView.setRenderRefreshListener(null)
             val components = contentPanel.components
             for (component in components) {
                 if (component === webView.browser.component) {

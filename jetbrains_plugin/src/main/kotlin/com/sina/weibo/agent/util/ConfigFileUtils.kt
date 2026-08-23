@@ -26,6 +26,38 @@ object ConfigFileUtils {
         // webview.offscreen.rendering=true in the config file.
         return getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_OFFSCREEN_RENDERING_KEY, "false")?.toBoolean() ?: false
     }
+
+    /**
+     * Whether the periodic WebView render-refresh watchdog is enabled.
+     * Defaults to true (see [PluginConstants.ConfigFiles.WEBVIEW_REFRESH_ENABLED_KEY]).
+     */
+    fun isWebViewRefreshEnabled(): Boolean {
+        return getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_REFRESH_ENABLED_KEY, "true")?.toBoolean() ?: true
+    }
+
+    /**
+     * Interval in milliseconds between periodic render-refresh nudges.
+     * Defaults to 2000, clamped to [200, 60000].
+     *
+     * Trade-off: a shorter interval keeps JS-driven updates (streaming tokens,
+     * animations — which never mark the dirty flag) fresher but reflows the
+     * page more often; a longer interval is cheaper but streaming appears
+     * laggier. Content updates via the plugin bridge are always flushed ~150ms
+     * later regardless of this value.
+     */
+    fun getWebViewRefreshIntervalMs(): Int {
+        val value = getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_REFRESH_INTERVAL_KEY, "2000")
+        return (value?.toIntOrNull() ?: 2000).coerceIn(200, 60_000)
+    }
+
+    /**
+     * Whether the "dirty pixel" 1px resize-and-restore cycle is used when
+     * refreshing the WebView. Defaults to true
+     * (see [PluginConstants.ConfigFiles.WEBVIEW_REFRESH_DIRTY_PIXEL_KEY]).
+     */
+    fun isWebViewRefreshDirtyPixelEnabled(): Boolean {
+        return getConfigValue(PluginConstants.ConfigFiles.WEBVIEW_REFRESH_DIRTY_PIXEL_KEY, "true")?.toBoolean() ?: true
+    }
     
     /**
      * Ensure configuration directory exists
