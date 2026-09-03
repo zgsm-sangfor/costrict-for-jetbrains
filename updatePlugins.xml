@@ -19,8 +19,8 @@
 <plugins>
   <plugin
       id="CoStrict"
-      version="3.0.17"
-      url="https://zgsm.sangfor.com/costrict-static/jetbrains-plugin/CoStrict-3.0.17.zip">
+      version="3.0.20"
+      url="https://zgsm.sangfor.com/costrict-static/jetbrains-plugin/CoStrict-3.0.20.zip">
     <name>CoStrict</name>
     <idea-version since-build="233"/>
     <description>CoStrict AI Coding Assistant</description>
